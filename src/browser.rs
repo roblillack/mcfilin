@@ -24,7 +24,8 @@
 //! Delete moves it to the trash, Shift+Delete deletes it for good once
 //! confirmed, and F2 edits the name of a single selected item in place —
 //! Enter, or a click elsewhere, renames it; Escape leaves it as it was. A new
-//! folder starts out with its name being edited. Cut and Copy put the
+//! folder starts out with its name being edited. Duplicate copies the
+//! selection next to itself as "name copy". Cut and Copy put the
 //! selection on the clipboard (see [`crate::clipboard`]); Paste brings it into
 //! the current folder — the last column's — and selects what arrived.
 
@@ -694,6 +695,19 @@ impl Browser {
         };
         self.show_errors(title, &errors);
         done
+    }
+
+    /// Copies the selection of the active column next to itself, as
+    /// "name copy", and selects the copies.
+    pub fn duplicate(&mut self) {
+        let slot = self.active_slot();
+        let paths = self.columns[slot].selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let dir = self.columns[slot].dir.clone();
+        let done = self.transfer(&paths, &dir, Op::Copy);
+        self.select_paths(&done);
     }
 
     pub fn cut(&mut self) {

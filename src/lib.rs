@@ -53,6 +53,8 @@ pub fn window(start: PathBuf) -> (WindowConfig, impl Widget) {
                     .with_accel(Accel::primary('n').shift()),
                 MenuItem::action("Re&name", act(Browser::start_rename))
                     .with_accel(Accel::new(NamedKey::F2)),
+                MenuItem::action("&Duplicate", act(Browser::duplicate))
+                    .with_accel(Accel::primary('d')),
                 MenuItem::separator(),
                 MenuItem::action("Move to &Trash", act(Browser::move_to_trash))
                     .with_accel(Accel::new(NamedKey::Delete)),
