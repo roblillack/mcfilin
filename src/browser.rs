@@ -20,6 +20,11 @@
 //! window's edge hands the drag to the desktop, so files can be dropped onto
 //! other applications; drops from other applications are copied in.
 //!
+//! The keyboard works in one column at a time: the arrow keys, Page Up/Down,
+//! Home and End move the selection, and with Shift held extend it from where
+//! it started, as Shift+click does. Select All and Deselect All act on that
+//! column too.
+//!
 //! The file operations act on the selection of the column the keyboard is in:
 //! Delete moves it to the trash, Shift+Delete deletes it for good once
 //! confirmed, and F2 edits the name of a single selected item in place —
@@ -477,6 +482,39 @@ impl Browser {
         let rows = self.rows_per_column();
         self.columns[slot].scroll_to(row, rows);
         self.set_selection(slot, vec![row]);
+    }
+
+    /// Selects everything in the active column.
+    pub fn select_all(&mut self) {
+        let slot = self.active_slot();
+        let len = self.columns[slot].entries.len();
+        if len == 0 {
+            return;
+        }
+        // As if Shift+clicked from the first row to the last: Shift and the
+        // arrow keys narrow it from the end.
+        let col = &mut self.columns[slot];
+        col.anchor = Some(0);
+        col.lead = Some(len - 1);
+        self.set_selection(slot, (0..len).collect());
+    }
+
+    /// Clears the selection of the active column.
+    pub fn deselect_all(&mut self) {
+        let slot = self.active_slot();
+        self.columns[slot].clear_selection();
+        self.set_selection(slot, vec![]);
+    }
+
+    /// Selects the rows from the anchor — where the selection started — to
+    /// `row`, which becomes the lead the keyboard moves on from.
+    fn extend_selection(&mut self, slot: usize, row: usize) {
+        let col = &mut self.columns[slot];
+        let anchor = *col.anchor.get_or_insert(col.lead.unwrap_or(row));
+        col.lead = Some(row);
+        let rows = self.rows_per_column();
+        self.columns[slot].scroll_to(row, rows);
+        self.set_selection(slot, (anchor.min(row)..=anchor.max(row)).collect());
     }
 
     /// Scrolls the path so its end — the deepest column, or the selected
@@ -1336,7 +1374,11 @@ impl Browser {
         if let Some(row) = target
             && len > 0
         {
-            self.select_row(slot, row.min(len - 1));
+            if mods.shift {
+                self.extend_selection(slot, row.min(len - 1));
+            } else {
+                self.select_row(slot, row.min(len - 1));
+            }
         }
         ctx.consume_event();
         ctx.request_paint();

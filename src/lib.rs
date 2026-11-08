@@ -70,6 +70,11 @@ pub fn window(start: PathBuf) -> (WindowConfig, impl Widget) {
                 MenuItem::action("Cu&t", act(Browser::cut)).with_accel(Accel::primary('x')),
                 MenuItem::action("&Copy", act(Browser::copy)).with_accel(Accel::primary('c')),
                 MenuItem::action("&Paste", act(Browser::paste)).with_accel(Accel::primary('v')),
+                MenuItem::separator(),
+                MenuItem::action("Select &All", act(Browser::select_all))
+                    .with_accel(Accel::primary('a')),
+                MenuItem::action("&Deselect All", act(Browser::deselect_all))
+                    .with_accel(Accel::primary('a').shift()),
             ],
         ))
         .add_menu(Menu::new(
