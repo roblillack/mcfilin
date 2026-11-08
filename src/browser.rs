@@ -1,0 +1,1338 @@
+//! The file viewer itself: NeXTSTEP-style Miller columns.
+//!
+//! From top to bottom the widget shows
+//!
+//! - the **path view**, one large icon per visible column naming the folder
+//!   that column lists (and, past the last folder, the selected file),
+//! - a horizontal **scroller** that pans the columns along the path,
+//! - the **columns**, as many as fit the window at [`MIN_COLUMN_WIDTH`], each
+//!   with its scroll bar on the right, and
+//! - a **status line**.
+//!
+//! Selecting a folder in a column opens the next column for it; the view keeps
+//! the end of the path in sight. Items are dragged with the mouse onto a folder
+//! row, a column (its folder), or a folder icon in the path view: a plain drop
+//! moves, holding Ctrl or Alt on release copies. On Wayland, dragging past the
+//! window's edge hands the drag to the desktop, so files can be dropped onto
+//! other applications; drops from other applications are copied in.
+
+use std::cell::RefCell;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use saudade::{
+    Color, Dialog, DragData, Event, EventCtx, Key, Merged, Modifiers, MouseButton, NamedKey,
+    Painter, Point, Rect, SCROLLBAR_THICKNESS, ScrollBar, SvgImage, Theme, Widget, include_svg,
+};
+
+use crate::fsops::{self, Entry, Op};
+
+const FOLDER_ICON: SvgImage = include_svg!("assets/icons/folder.svg");
+const FILE_ICON: SvgImage = include_svg!("assets/icons/file.svg");
+const FOLDER_LARGE: SvgImage = include_svg!("assets/icons/folder-large.svg");
+const FILE_LARGE: SvgImage = include_svg!("assets/icons/file-large.svg");
+const FILES_LARGE: SvgImage = include_svg!("assets/icons/files-large.svg");
+
+/// The narrowest a column gets before the window shows one column fewer.
+pub const MIN_COLUMN_WIDTH: i32 = 170;
+const COLUMN_GAP: i32 = 6;
+const MARGIN: i32 = 6;
+const ROW_H: i32 = 16;
+const ROW_PAD_Y: i32 = 2;
+const SMALL_ICON: i32 = 16;
+const LARGE_ICON: i32 = 32;
+const PATH_H: i32 = 64;
+const STATUS_H: i32 = 20;
+/// How far the pointer must travel from a press before it becomes a drag.
+const DRAG_THRESHOLD: i32 = 5;
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// How long typed letters keep adding up to one type-ahead search.
+const TYPE_AHEAD: Duration = Duration::from_millis(1000);
+
+// ============================================================================
+// One column: the listing of a folder plus its selection and scroll position.
+// ============================================================================
+
+struct BrowserColumn {
+    dir: PathBuf,
+    entries: Vec<Entry>,
+    /// Why the folder couldn't be listed, shown in place of its entries.
+    error: Option<String>,
+    /// Selected rows, ascending.
+    selected: Vec<usize>,
+    /// Where a Shift+click range starts.
+    anchor: Option<usize>,
+    /// The row the keyboard moves from: the one most recently clicked.
+    lead: Option<usize>,
+    /// Vertical scroll bar; its value is the top visible row.
+    bar: ScrollBar,
+}
+
+impl BrowserColumn {
+    fn open(dir: PathBuf, show_hidden: bool) -> Self {
+        let mut col = Self {
+            dir,
+            entries: Vec::new(),
+            error: None,
+            selected: Vec::new(),
+            anchor: None,
+            lead: None,
+            bar: ScrollBar::vertical(Rect::new(0, 0, 0, 0)),
+        };
+        col.read(show_hidden);
+        col
+    }
+
+    fn read(&mut self, show_hidden: bool) {
+        match fsops::read_entries(&self.dir, show_hidden) {
+            Ok(entries) => {
+                self.entries = entries;
+                self.error = None;
+            }
+            Err(e) => {
+                self.entries.clear();
+                self.error = Some(e.kind().to_string());
+            }
+        }
+    }
+
+    /// Re-lists the folder, keeping the selection, lead, and anchor on the same
+    /// names wherever they still exist.
+    fn reread(&mut self, show_hidden: bool) {
+        let name = |i: Option<usize>, entries: &[Entry]| i.map(|i| entries[i].name.clone());
+        let selected: Vec<OsString> = self
+            .selected
+            .iter()
+            .map(|&i| self.entries[i].name.clone())
+            .collect();
+        let lead = name(self.lead, &self.entries);
+        let anchor = name(self.anchor, &self.entries);
+        self.read(show_hidden);
+        self.selected = selected.iter().filter_map(|n| self.index_of(n)).collect();
+        self.selected.sort_unstable();
+        self.lead = lead.and_then(|n| self.index_of(&n));
+        self.anchor = anchor.and_then(|n| self.index_of(&n));
+    }
+
+    fn index_of(&self, name: &OsStr) -> Option<usize> {
+        self.entries.iter().position(|e| e.name == name)
+    }
+
+    fn path_of(&self, row: usize) -> PathBuf {
+        self.dir.join(&self.entries[row].name)
+    }
+
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        self.selected.iter().map(|&i| self.path_of(i)).collect()
+    }
+
+    /// The folder the next column lists: the selection, if it is exactly one
+    /// folder.
+    fn single_dir(&self) -> Option<PathBuf> {
+        match self.selected[..] {
+            [i] if self.entries[i].is_dir => Some(self.path_of(i)),
+            _ => None,
+        }
+    }
+
+    fn select_only(&mut self, row: usize) {
+        self.selected = vec![row];
+        self.anchor = Some(row);
+        self.lead = Some(row);
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.anchor = None;
+        self.lead = None;
+    }
+
+    /// Scrolls so `row` is on screen, given how many rows fit.
+    fn scroll_to(&mut self, row: usize, rows: usize) {
+        let top = self.bar.value().max(0) as usize;
+        let rows = rows.max(1);
+        let new_top = if row < top {
+            row
+        } else if row >= top + rows {
+            row + 1 - rows
+        } else {
+            top
+        };
+        // The bar clamps to its range, which may not be set yet; keep the
+        // wanted value in the range we know the list will have.
+        self.bar.set_range(rows as i32, self.entries.len().saturating_sub(rows) as i32);
+        self.bar.set_value(new_top as i32);
+    }
+}
+
+// ============================================================================
+// Interaction state.
+// ============================================================================
+
+/// Where something dragged would land, and what lights up to say so.
+#[derive(Clone, Debug, PartialEq)]
+enum Highlight {
+    /// A folder row: `(slot, row)`.
+    Row(usize, usize),
+    /// A column as a whole — its own folder.
+    Column(usize),
+    /// A folder icon in the path view.
+    PathIcon(usize),
+}
+
+#[derive(Clone, Debug)]
+struct Target {
+    dir: PathBuf,
+    highlight: Highlight,
+}
+
+/// What a press on the left button started, followed until its release.
+enum Gesture {
+    Idle,
+    /// Operating the horizontal scroller.
+    HScroll,
+    /// Operating the scroll bar of the column in this slot.
+    ColumnBar(usize),
+    /// Pressed, not yet moved far enough to drag. `paths` is what a drag would
+    /// carry.
+    Press {
+        origin: Point,
+        paths: Vec<PathBuf>,
+        click: Click,
+    },
+    /// Dragging `paths` around inside the window.
+    Drag {
+        paths: Vec<PathBuf>,
+        pos: Point,
+        /// The drop target under the pointer, assuming a move.
+        target: Option<Target>,
+    },
+}
+
+/// What a press turns into if it is released without dragging.
+enum Click {
+    Nothing,
+    /// A press on a row of a multi-selection keeps the whole group selected
+    /// (so it can be dragged) and narrows it to this row on release.
+    Collapse { slot: usize, row: usize },
+    /// A press on an icon of the path view goes there on release.
+    PathIcon(usize),
+}
+
+/// What sits in one slot of the path view.
+struct SlotInfo {
+    icon: SvgImage,
+    label: String,
+    /// What dragging the icon carries.
+    paths: Vec<PathBuf>,
+}
+
+// ============================================================================
+// The browser widget.
+// ============================================================================
+
+pub struct Browser {
+    bounds: Rect,
+    /// Column `i` lists `columns[i].dir`; the selection in column `i` decides
+    /// column `i + 1`. Column 0 is the filesystem root.
+    columns: Vec<BrowserColumn>,
+    /// The first slot on screen. A slot is a column, plus — when the last
+    /// column has files selected — one empty slot past it for the files'
+    /// icon, as NeXT's browser shows it.
+    first: usize,
+    /// How many columns fit the window.
+    visible: usize,
+    /// The column the keyboard works in.
+    active: usize,
+    focused: bool,
+    show_hidden: bool,
+    hscroll: ScrollBar,
+    /// Scroll bars for the empty columns past the end of the path.
+    blank_bars: Vec<ScrollBar>,
+    gesture: Gesture,
+    /// The last row clicked, for double-clicks: `(slot, row, when)`.
+    last_click: Option<(usize, usize, Instant)>,
+    typed: String,
+    typed_at: Instant,
+    /// The files of a drag handed to the desktop, so dropping it back into the
+    /// window moves them like a drag that never left.
+    os_drag: Option<Vec<PathBuf>>,
+    /// The drop target under a drag coming from outside the window.
+    os_hover: Option<Highlight>,
+    /// Lead rows still to be scrolled into view once the columns have a size.
+    reveal_pending: bool,
+    dialog: Rc<RefCell<Dialog>>,
+}
+
+impl Browser {
+    pub fn new(start: &Path, dialog: Rc<RefCell<Dialog>>) -> Self {
+        let mut me = Self {
+            bounds: Rect::new(0, 0, 0, 0),
+            columns: Vec::new(),
+            first: 0,
+            visible: 1,
+            active: 0,
+            focused: false,
+            show_hidden: false,
+            hscroll: ScrollBar::horizontal(Rect::new(0, 0, 0, 0)),
+            blank_bars: Vec::new(),
+            gesture: Gesture::Idle,
+            last_click: None,
+            typed: String::new(),
+            typed_at: Instant::now(),
+            os_drag: None,
+            os_hover: None,
+            reveal_pending: false,
+            dialog,
+        };
+        me.go_to(start);
+        me
+    }
+
+    // ------------------------------------------------------------------
+    // Navigation.
+    // ------------------------------------------------------------------
+
+    /// Opens the columns from the root down to `target`, selecting each step,
+    /// and `target` itself in the last column if it is a file.
+    pub fn go_to(&mut self, target: &Path) {
+        let target = target.canonicalize().unwrap_or_else(|_| target.to_path_buf());
+        let mut steps: Vec<&Path> = target.ancestors().collect();
+        steps.reverse();
+        let Some((root, rest)) = steps.split_first() else {
+            return;
+        };
+        self.columns = vec![BrowserColumn::open(root.to_path_buf(), self.show_hidden)];
+        for step in rest {
+            let Some(name) = step.file_name() else { break };
+            if !self.show_hidden && name.to_string_lossy().starts_with('.') {
+                // Going somewhere hidden shows hidden files, or the path
+                // couldn't be shown at all.
+                self.show_hidden = true;
+                for col in &mut self.columns {
+                    col.reread(true);
+                }
+            }
+            let col = self.columns.last_mut().expect("the root column");
+            let Some(row) = col.index_of(name) else { break };
+            col.select_only(row);
+            if !col.entries[row].is_dir {
+                break;
+            }
+            self.columns
+                .push(BrowserColumn::open(step.to_path_buf(), self.show_hidden));
+        }
+        self.active = self.columns.len() - 1;
+        self.reveal_pending = true;
+        self.reveal_end();
+    }
+
+    /// The folder new things are made in: the one the last column lists.
+    pub fn current_dir(&self) -> &Path {
+        &self.columns.last().expect("at least the root column").dir
+    }
+
+    pub fn go_home(&mut self) {
+        if let Some(home) = std::env::home_dir() {
+            self.go_to(&home);
+        }
+    }
+
+    /// Moves the keyboard to the column to the left, clearing the selection in
+    /// the column it leaves.
+    pub fn go_parent(&mut self) {
+        let slot = self.active.min(self.columns.len() - 1);
+        if slot == 0 {
+            return;
+        }
+        self.columns.truncate(slot + 1);
+        self.columns[slot].clear_selection();
+        self.active = slot - 1;
+        self.reveal_end();
+    }
+
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
+    }
+
+    pub fn toggle_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.reload();
+    }
+
+    /// Re-reads every column from disk, keeping selections by name and closing
+    /// columns whose folder is gone.
+    pub fn reload(&mut self) {
+        let mut i = 0;
+        while i < self.columns.len() {
+            if i > 0 && !self.columns[i].dir.is_dir() {
+                self.columns.truncate(i);
+                break;
+            }
+            self.columns[i].reread(self.show_hidden);
+            let want = self.columns[i].single_dir();
+            let next_ok = matches!((&want, self.columns.get(i + 1)), (Some(w), Some(next)) if next.dir == *w);
+            if !next_ok {
+                self.columns.truncate(i + 1);
+                if let Some(dir) = want {
+                    self.columns.push(BrowserColumn::open(dir, self.show_hidden));
+                }
+            }
+            i += 1;
+        }
+        self.active = self.active.min(self.columns.len() - 1);
+        self.sync();
+    }
+
+    /// Sets the selection of the column in `slot`, closes the columns past it
+    /// and opens one for the selection if it is a single folder.
+    fn set_selection(&mut self, slot: usize, selected: Vec<usize>) {
+        let col = &mut self.columns[slot];
+        let unchanged = col.selected == selected;
+        col.selected = selected;
+        let want = col.single_dir();
+        // Re-picking the folder that's already open keeps its column as it is.
+        let keep = unchanged
+            && want.is_some()
+            && self.columns.get(slot + 1).map(|c| &c.dir) == want.as_ref();
+        if !keep {
+            self.columns.truncate(slot + 1);
+            if let Some(dir) = want {
+                self.columns.push(BrowserColumn::open(dir, self.show_hidden));
+            }
+        }
+        self.active = slot;
+        self.reveal_end();
+    }
+
+    fn select_row(&mut self, slot: usize, row: usize) {
+        self.columns[slot].select_only(row);
+        let rows = self.rows_per_column();
+        self.columns[slot].scroll_to(row, rows);
+        self.set_selection(slot, vec![row]);
+    }
+
+    /// Scrolls the path so its end — the deepest column, or the selected
+    /// files' slot — is the rightmost one on screen.
+    fn reveal_end(&mut self) {
+        self.first = self.slots().saturating_sub(self.visible);
+        self.sync();
+    }
+
+    /// Opens the selection of the active column: folders by moving into them,
+    /// files with the application the desktop has for them.
+    pub fn open_selection(&mut self) {
+        let slot = self.active.min(self.columns.len() - 1);
+        if self.columns[slot].single_dir().is_some() {
+            self.enter_next_column();
+            return;
+        }
+        let mut errors = Vec::new();
+        for path in self.columns[slot].selected_paths() {
+            if let Err(e) = fsops::open_with_system(&path) {
+                errors.push(format!("{}: {e}", fsops::display_name(&path)));
+            }
+        }
+        self.show_errors("Couldn't open", &errors);
+    }
+
+    fn enter_next_column(&mut self) {
+        let slot = self.active.min(self.columns.len() - 1);
+        if self.columns[slot].single_dir().is_some()
+            && self.columns.get(slot + 1).is_some_and(|c| !c.entries.is_empty())
+        {
+            let row = self.columns[slot + 1].lead.unwrap_or(0);
+            self.select_row(slot + 1, row);
+        }
+    }
+
+    pub fn new_folder(&mut self) {
+        let dir = self.current_dir().to_path_buf();
+        match fsops::new_folder(&dir) {
+            Ok(path) => {
+                self.reload();
+                let slot = self.columns.iter().position(|c| c.dir == dir);
+                if let (Some(slot), Some(name)) = (slot, path.file_name())
+                    && let Some(row) = self.columns[slot].index_of(name)
+                {
+                    self.select_row(slot, row);
+                }
+            }
+            Err(e) => self.show_errors("Couldn't create a folder", &[e.to_string()]),
+        }
+    }
+
+    fn transfer(&mut self, paths: &[PathBuf], dest: &Path, op: Op) {
+        let (_, errors) = fsops::transfer(paths, dest, op);
+        self.reload();
+        let title = match op {
+            Op::Move => "Couldn't move",
+            Op::Copy => "Couldn't copy",
+        };
+        self.show_errors(title, &errors);
+    }
+
+    fn show_errors(&self, title: &str, errors: &[String]) {
+        if !errors.is_empty() {
+            self.dialog.borrow_mut().show_error(title, errors.join("\n"));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Geometry.
+    // ------------------------------------------------------------------
+
+    /// How many slots the path has: the columns, plus one for the selected
+    /// files of the last column.
+    fn slots(&self) -> usize {
+        let files = self
+            .columns
+            .last()
+            .is_some_and(|c| !c.selected.is_empty());
+        self.columns.len() + files as usize
+    }
+
+    fn path_rect(&self) -> Rect {
+        let b = self.bounds;
+        Rect::new(b.x + MARGIN, b.y + MARGIN, (b.w - 2 * MARGIN).max(0), PATH_H)
+    }
+
+    fn hscroll_rect(&self) -> Rect {
+        // Shares its top edge with the path view's bottom border.
+        let p = self.path_rect();
+        Rect::new(p.x, p.bottom() - 1, p.w, SCROLLBAR_THICKNESS)
+    }
+
+    fn columns_rect(&self) -> Rect {
+        let b = self.bounds;
+        let top = self.hscroll_rect().bottom() + MARGIN;
+        let bottom = b.bottom() - STATUS_H;
+        Rect::new(b.x + MARGIN, top, (b.w - 2 * MARGIN).max(0), (bottom - top).max(0))
+    }
+
+    fn status_rect(&self) -> Rect {
+        let b = self.bounds;
+        Rect::new(b.x + MARGIN, b.bottom() - STATUS_H, (b.w - 2 * MARGIN).max(0), STATUS_H)
+    }
+
+    /// The `v`-th of the visible cells across `area`, which share its width
+    /// evenly with a gap between each two.
+    fn cell(&self, v: usize, area: Rect) -> Rect {
+        let n = self.visible as i32;
+        let v = v as i32;
+        let total = (area.w - COLUMN_GAP * (n - 1)).max(0);
+        let base = total / n;
+        let extra = total % n;
+        let x = area.x + v * (base + COLUMN_GAP) + v.min(extra);
+        Rect::new(x, area.y, base + (v < extra) as i32, area.h)
+    }
+
+    fn bar_rect(cell: Rect) -> Rect {
+        Rect::new(cell.right() - SCROLLBAR_THICKNESS, cell.y, SCROLLBAR_THICKNESS, cell.h)
+    }
+
+    /// The white list area of a column cell, sharing its right border with
+    /// the scroll bar's left one.
+    fn field_rect(cell: Rect) -> Rect {
+        let d = SCROLLBAR_THICKNESS - 1;
+        Rect::new(cell.x, cell.y, (cell.w - d).max(0), cell.h)
+    }
+
+    fn rows_per_column(&self) -> usize {
+        ((self.columns_rect().h - 2 * ROW_PAD_Y) / ROW_H).max(1) as usize
+    }
+
+    /// The visible index of the cell under `x`, if any.
+    fn visible_at(&self, x: i32, area: Rect) -> Option<usize> {
+        (0..self.visible).find(|&v| {
+            let c = self.cell(v, area);
+            x >= c.x && x < c.right()
+        })
+    }
+
+    /// The column slot under `pos` in the columns area.
+    fn column_slot_at(&self, pos: Point) -> Option<usize> {
+        let area = self.columns_rect();
+        if !area.contains(pos) {
+            return None;
+        }
+        self.visible_at(pos.x, area).map(|v| self.first + v)
+    }
+
+    /// The path-view slot under `pos`, if one is shown there.
+    fn path_slot_at(&self, pos: Point) -> Option<usize> {
+        let area = self.path_rect();
+        if !area.contains(pos) {
+            return None;
+        }
+        let slot = self.first + self.visible_at(pos.x, area)?;
+        (slot < self.slots()).then_some(slot)
+    }
+
+    /// The row of the column in `slot` under `pos`.
+    fn row_at(&self, slot: usize, pos: Point) -> Option<usize> {
+        let col = self.columns.get(slot)?;
+        let v = slot.checked_sub(self.first)?;
+        let field = Self::field_rect(self.cell(v, self.columns_rect()));
+        if !field.contains(pos) || pos.y < field.y + ROW_PAD_Y {
+            return None;
+        }
+        let row = col.bar.value().max(0) as usize + ((pos.y - field.y - ROW_PAD_Y) / ROW_H) as usize;
+        (row < col.entries.len()).then_some(row)
+    }
+
+    /// Brings every derived bit of geometry up to date with the bounds and the
+    /// columns: how many columns fit, where every scroll bar sits and how far
+    /// it scrolls.
+    fn sync(&mut self) {
+        let area = self.columns_rect();
+        let n = ((area.w + COLUMN_GAP) / (MIN_COLUMN_WIDTH + COLUMN_GAP)).max(1) as usize;
+        if n != self.visible {
+            // Resizing keeps the end of the path where it was: on the right.
+            self.visible = n;
+            self.first = self.slots().saturating_sub(n);
+        }
+        let max_first = self.slots().saturating_sub(n);
+        self.first = self.first.min(max_first);
+        self.active = self.active.min(self.columns.len() - 1);
+
+        self.hscroll.set_rect(self.hscroll_rect());
+        self.hscroll.set_range(n as i32, max_first as i32);
+        self.hscroll.set_value(self.first as i32);
+
+        let rows = self.rows_per_column();
+        for col in &mut self.columns {
+            col.bar.set_rect(Rect::new(0, 0, 0, 0));
+        }
+        self.blank_bars.resize_with(n, || ScrollBar::vertical(Rect::new(0, 0, 0, 0)));
+        for v in 0..n {
+            let cell = self.cell(v, area);
+            let slot = self.first + v;
+            if let Some(col) = self.columns.get_mut(slot) {
+                col.bar.set_rect(Self::bar_rect(cell));
+                col.bar
+                    .set_range(rows as i32, col.entries.len().saturating_sub(rows) as i32);
+                self.blank_bars[v].set_rect(Rect::new(0, 0, 0, 0));
+            } else {
+                self.blank_bars[v].set_rect(Self::bar_rect(cell));
+            }
+        }
+
+        if self.reveal_pending && area.h > 0 {
+            self.reveal_pending = false;
+            for col in &mut self.columns {
+                if let Some(lead) = col.lead {
+                    // Put the lead row a third of the way down, not on an edge.
+                    col.bar.set_value(lead as i32 - rows as i32 / 3);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Drag and drop.
+    // ------------------------------------------------------------------
+
+    /// What a slot of the path view shows.
+    fn slot_info(&self, slot: usize) -> Option<SlotInfo> {
+        if let Some(col) = self.columns.get(slot) {
+            let is_root = col.dir.parent().is_none();
+            return Some(SlotInfo {
+                icon: FOLDER_LARGE,
+                label: fsops::display_name(&col.dir),
+                paths: if is_root { vec![] } else { vec![col.dir.clone()] },
+            });
+        }
+        let last = self.columns.last()?;
+        if slot != self.columns.len() || last.selected.is_empty() {
+            return None;
+        }
+        let paths = last.selected_paths();
+        Some(match &last.selected[..] {
+            [i] => SlotInfo {
+                icon: if last.entries[*i].is_dir { FOLDER_LARGE } else { FILE_LARGE },
+                label: last.entries[*i].label.clone(),
+                paths,
+            },
+            many => SlotInfo {
+                icon: FILES_LARGE,
+                label: format!("{} items", many.len()),
+                paths,
+            },
+        })
+    }
+
+    /// The folder under `pos` that would take a drop, whatever is dragged.
+    fn raw_target_at(&self, pos: Point) -> Option<Target> {
+        if self.path_rect().contains(pos) {
+            let slot = self.path_slot_at(pos)?;
+            let col = self.columns.get(slot)?;
+            return Some(Target {
+                dir: col.dir.clone(),
+                highlight: Highlight::PathIcon(slot),
+            });
+        }
+        let slot = self.column_slot_at(pos)?;
+        let col = self.columns.get(slot)?;
+        if let Some(row) = self.row_at(slot, pos)
+            && col.entries[row].is_dir
+        {
+            return Some(Target {
+                dir: col.path_of(row),
+                highlight: Highlight::Row(slot, row),
+            });
+        }
+        Some(Target {
+            dir: col.dir.clone(),
+            highlight: Highlight::Column(slot),
+        })
+    }
+
+    fn target_at(&self, pos: Point, paths: &[PathBuf], op: Op) -> Option<Target> {
+        self.raw_target_at(pos)
+            .filter(|t| fsops::can_drop(paths, &t.dir, op))
+    }
+
+    fn highlight(&self) -> Option<&Highlight> {
+        match &self.gesture {
+            Gesture::Drag { target, .. } => target.as_ref().map(|t| &t.highlight),
+            _ => self.os_hover.as_ref(),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Pointer handling.
+    // ------------------------------------------------------------------
+
+    fn pointer_down(&mut self, event: &Event, pos: Point, mods: Modifiers, ctx: &mut EventCtx) {
+        self.os_drag = None;
+        if self.hscroll.rect().contains(pos) {
+            self.hscroll.event(event, ctx);
+            self.gesture = Gesture::HScroll;
+            self.follow_hscroll();
+            return;
+        }
+        if let Some(slot) = self.path_slot_at(pos) {
+            let paths = self.slot_info(slot).map(|s| s.paths).unwrap_or_default();
+            self.gesture = Gesture::Press {
+                origin: pos,
+                paths,
+                click: Click::PathIcon(slot),
+            };
+            return;
+        }
+        let Some(slot) = self.column_slot_at(pos) else {
+            return;
+        };
+        if slot >= self.columns.len() {
+            return; // an empty column past the end of the path
+        }
+        if self.columns[slot].bar.rect().contains(pos) {
+            self.columns[slot].bar.event(event, ctx);
+            self.gesture = Gesture::ColumnBar(slot);
+            return;
+        }
+        let Some(row) = self.row_at(slot, pos) else {
+            // Below the last row: deselect, showing this column's folder.
+            self.columns[slot].clear_selection();
+            self.set_selection(slot, vec![]);
+            return;
+        };
+
+        let now = Instant::now();
+        let double = self
+            .last_click
+            .is_some_and(|(s, r, t)| s == slot && r == row && now - t < DOUBLE_CLICK);
+        self.last_click = if double { None } else { Some((slot, row, now)) };
+
+        let mut click = Click::Nothing;
+        let col = &mut self.columns[slot];
+        let toggle = mods.control || mods.logo;
+        if mods.shift && let Some(anchor) = col.anchor {
+            let (a, b) = (anchor.min(row), anchor.max(row));
+            col.lead = Some(row);
+            self.set_selection(slot, (a..=b).collect());
+        } else if toggle {
+            let mut sel = col.selected.clone();
+            match sel.binary_search(&row) {
+                Ok(i) => {
+                    sel.remove(i);
+                }
+                Err(i) => sel.insert(i, row),
+            }
+            col.anchor = Some(row);
+            col.lead = Some(row);
+            self.set_selection(slot, sel);
+        } else if col.selected.len() > 1 && col.selected.contains(&row) {
+            col.lead = Some(row);
+            col.anchor = Some(row);
+            self.active = slot;
+            click = Click::Collapse { slot, row };
+        } else {
+            col.select_only(row);
+            self.set_selection(slot, vec![row]);
+        }
+
+        if double {
+            self.open_selection();
+            return;
+        }
+        self.gesture = Gesture::Press {
+            origin: pos,
+            paths: self.columns[slot].selected_paths(),
+            click,
+        };
+    }
+
+    fn pointer_move(&mut self, event: &Event, pos: Point, ctx: &mut EventCtx) {
+        match &mut self.gesture {
+            Gesture::Idle => {}
+            Gesture::HScroll => {
+                self.hscroll.event(event, ctx);
+                self.follow_hscroll();
+            }
+            Gesture::ColumnBar(slot) => {
+                let slot = *slot;
+                if let Some(col) = self.columns.get_mut(slot) {
+                    col.bar.event(event, ctx);
+                }
+            }
+            Gesture::Press { origin, paths, .. } => {
+                let (dx, dy) = (pos.x - origin.x, pos.y - origin.y);
+                if dx * dx + dy * dy >= DRAG_THRESHOLD * DRAG_THRESHOLD && !paths.is_empty() {
+                    let paths = std::mem::take(paths);
+                    let target = self.target_at(pos, &paths, Op::Move);
+                    self.gesture = Gesture::Drag { paths, pos, target };
+                }
+            }
+            Gesture::Drag { .. } => {
+                if !self.window_rect().contains(pos) && wayland_session() {
+                    // Off the window: hand the drag to the desktop so it can
+                    // land in another application.
+                    if let Gesture::Drag { paths, .. } =
+                        std::mem::replace(&mut self.gesture, Gesture::Idle)
+                    {
+                        ctx.start_drag(DragData::from_paths(paths.clone()));
+                        self.os_drag = Some(paths);
+                    }
+                } else {
+                    let new_target = match &self.gesture {
+                        Gesture::Drag { paths, .. } => self.target_at(pos, paths, Op::Move),
+                        _ => None,
+                    };
+                    if let Gesture::Drag { pos: p, target, .. } = &mut self.gesture {
+                        *p = pos;
+                        *target = new_target;
+                    }
+                }
+            }
+        }
+        ctx.request_paint();
+    }
+
+    fn pointer_up(&mut self, event: &Event, pos: Point, mods: Modifiers, ctx: &mut EventCtx) {
+        match std::mem::replace(&mut self.gesture, Gesture::Idle) {
+            Gesture::Idle => {}
+            Gesture::HScroll => {
+                self.hscroll.event(event, ctx);
+                self.follow_hscroll();
+            }
+            Gesture::ColumnBar(slot) => {
+                if let Some(col) = self.columns.get_mut(slot) {
+                    col.bar.event(event, ctx);
+                }
+            }
+            Gesture::Press { click, .. } => match click {
+                Click::Nothing => {}
+                Click::Collapse { slot, row } => {
+                    if slot < self.columns.len() {
+                        self.columns[slot].select_only(row);
+                        self.set_selection(slot, vec![row]);
+                    }
+                }
+                Click::PathIcon(slot) => self.go_to_slot(slot),
+            },
+            Gesture::Drag { paths, .. } => {
+                let op = if mods.control || mods.alt || mods.logo {
+                    Op::Copy
+                } else {
+                    Op::Move
+                };
+                if let Some(target) = self.target_at(pos, &paths, op) {
+                    self.transfer(&paths, &target.dir, op);
+                }
+            }
+        }
+        ctx.request_paint();
+    }
+
+    /// A click on a path-view icon: show that folder as the end of the path.
+    fn go_to_slot(&mut self, slot: usize) {
+        if slot + 1 >= self.slots() {
+            return; // already the end
+        }
+        self.columns.truncate(slot + 1);
+        self.columns[slot].clear_selection();
+        self.active = slot;
+        self.reveal_end();
+    }
+
+    fn follow_hscroll(&mut self) {
+        let value = self.hscroll.value().max(0) as usize;
+        if value != self.first {
+            self.first = value;
+            self.sync();
+        }
+    }
+
+    /// The whole window, as far as this widget can tell: it fills the window
+    /// below the menu bar.
+    fn window_rect(&self) -> Rect {
+        Rect::new(0, 0, self.bounds.right(), self.bounds.bottom())
+    }
+
+    fn scroll(&mut self, pos: Point, delta_x: f32, delta_y: f32, ctx: &mut EventCtx) {
+        if self.path_rect().contains(pos) || self.hscroll.rect().contains(pos) {
+            let ev = Event::Scroll {
+                pos,
+                delta_x: delta_x + delta_y,
+                delta_y: 0.0,
+            };
+            self.hscroll.event(&ev, ctx);
+            self.follow_hscroll();
+        } else if let Some(slot) = self.column_slot_at(pos)
+            && let Some(col) = self.columns.get_mut(slot)
+        {
+            col.bar.event(
+                &Event::Scroll {
+                    pos,
+                    delta_x: 0.0,
+                    delta_y,
+                },
+                ctx,
+            );
+        } else if delta_x != 0.0 {
+            let ev = Event::Scroll {
+                pos,
+                delta_x,
+                delta_y: 0.0,
+            };
+            self.hscroll.event(&ev, ctx);
+            self.follow_hscroll();
+        }
+        // While dragging, what's under the pointer has just changed.
+        if let Gesture::Drag { pos, .. } = self.gesture {
+            let new_target = match &self.gesture {
+                Gesture::Drag { paths, .. } => self.target_at(pos, paths, Op::Move),
+                _ => None,
+            };
+            if let Gesture::Drag { target, .. } = &mut self.gesture {
+                *target = new_target;
+            }
+        }
+        ctx.request_paint();
+    }
+
+    // ------------------------------------------------------------------
+    // Keyboard handling.
+    // ------------------------------------------------------------------
+
+    fn key_down(&mut self, key: &Key, mods: Modifiers, ctx: &mut EventCtx) {
+        if mods.control || mods.alt || mods.logo {
+            if let Key::Named(NamedKey::Up) = key {
+                self.go_parent();
+                ctx.request_paint();
+            }
+            return; // the menu bar's accelerators
+        }
+        let slot = self.active.min(self.columns.len() - 1);
+        let len = self.columns[slot].entries.len();
+        let page = self.rows_per_column().saturating_sub(1).max(1);
+        let lead = self.columns[slot].lead;
+        let target = match key {
+            Key::Named(NamedKey::Up) => Some(lead.map_or(0, |l| l.saturating_sub(1))),
+            Key::Named(NamedKey::Down) => Some(lead.map_or(0, |l| l + 1)),
+            Key::Named(NamedKey::PageUp) => Some(lead.map_or(0, |l| l.saturating_sub(page))),
+            Key::Named(NamedKey::PageDown) => Some(lead.map_or(0, |l| l + page)),
+            Key::Named(NamedKey::Home) => Some(0),
+            Key::Named(NamedKey::End) => Some(len.saturating_sub(1)),
+            Key::Named(NamedKey::Left | NamedKey::Backspace) => {
+                self.go_parent();
+                None
+            }
+            Key::Named(NamedKey::Right) => {
+                self.enter_next_column();
+                None
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.open_selection();
+                None
+            }
+            _ => return,
+        };
+        if let Some(row) = target
+            && len > 0
+        {
+            self.select_row(slot, row.min(len - 1));
+        }
+        ctx.consume_event();
+        ctx.request_paint();
+    }
+
+    /// Type-ahead: jump to the first entry of the active column starting with
+    /// what was typed in the last second.
+    fn type_ahead(&mut self, ch: char, ctx: &mut EventCtx) {
+        if ch.is_control() {
+            return;
+        }
+        if self.typed_at.elapsed() > TYPE_AHEAD {
+            self.typed.clear();
+        }
+        self.typed_at = Instant::now();
+        self.typed.extend(ch.to_lowercase());
+        let slot = self.active.min(self.columns.len() - 1);
+        let hit = self.columns[slot]
+            .entries
+            .iter()
+            .position(|e| e.label.to_lowercase().starts_with(&self.typed));
+        if let Some(row) = hit {
+            self.select_row(slot, row);
+            ctx.request_paint();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Painting.
+    // ------------------------------------------------------------------
+
+    fn paint_path_view(&mut self, p: &mut Painter, theme: &Theme) {
+        let area = self.path_rect();
+        p.fill_rect(area, theme.background);
+        p.sunken_bevel(area, theme.highlight, theme.shadow);
+        p.stroke_rect(area, theme.border);
+        let saved = p.push_clip_frame(area, 1, Merged::NONE);
+        let slots = self.slots();
+        let highlight = self.highlight().cloned();
+        for v in 0..self.visible {
+            let slot = self.first + v;
+            let Some(info) = self.slot_info(slot) else { break };
+            let cell = self.cell(v, area);
+            let icon = Rect::new(
+                cell.x + (cell.w - LARGE_ICON) / 2,
+                area.y + 7,
+                LARGE_ICON,
+                LARGE_ICON,
+            );
+            if highlight == Some(Highlight::PathIcon(slot)) {
+                p.fill_rect(icon.inset(-3), theme.highlight_bg);
+            }
+            p.draw_svg(&info.icon, icon);
+
+            let label = fit_text(p, &info.label, theme.font_size, cell.w - 8);
+            let w = p.measure_text(&label, theme.font_size).w;
+            let ly = icon.bottom() + 5;
+            p.text(cell.x + (cell.w - w) / 2, ly, &label, theme.font_size, theme.text);
+
+            if slot + 1 < slots && v + 1 < self.visible {
+                // The little arrow leading on to the next step of the path.
+                let x = cell.right() + COLUMN_GAP / 2 - 2;
+                draw_arrow(p, x, icon.y + LARGE_ICON / 2, theme.text);
+            }
+        }
+        p.restore_clip(saved);
+    }
+
+    fn paint_column(&mut self, p: &mut Painter, theme: &Theme, v: usize) {
+        let cell = self.cell(v, self.columns_rect());
+        let field = Self::field_rect(cell);
+        let slot = self.first + v;
+        p.fill_rect(field, theme.background);
+        p.sunken_bevel_merged(field, Merged::RIGHT, theme.highlight, theme.shadow);
+        p.stroke_rect_merged(field, Merged::RIGHT, theme.border);
+
+        let highlight = self.highlight().cloned();
+        let active = self.focused && slot == self.active;
+        if let Some(col) = self.columns.get(slot) {
+            let saved = p.push_clip_frame(field, 1, Merged::RIGHT);
+            let top = col.bar.value().max(0) as usize;
+            let rows = self.rows_per_column();
+            for (i, entry) in col.entries.iter().enumerate().skip(top).take(rows + 1) {
+                let y = field.y + ROW_PAD_Y + (i - top) as i32 * ROW_H;
+                let row_rect = Rect::new(field.x, y, field.w, ROW_H);
+                let selected = col.selected.binary_search(&i).is_ok();
+                let target = highlight == Some(Highlight::Row(slot, i));
+                let (fg, bg) = if target || (selected && active) {
+                    (theme.highlight_text, Some(theme.highlight_bg))
+                } else if selected {
+                    (theme.text, Some(theme.face))
+                } else {
+                    (theme.text, None)
+                };
+                if let Some(bg) = bg {
+                    p.fill_rect(row_rect, bg);
+                }
+                let icon_x = field.x + 4;
+                let icon = if entry.is_dir { FOLDER_ICON } else { FILE_ICON };
+                p.draw_svg(
+                    &icon,
+                    Rect::new(icon_x, y + (ROW_H - SMALL_ICON) / 2, SMALL_ICON, SMALL_ICON),
+                );
+                let label_x = icon_x + SMALL_ICON + 4;
+                let arrow_w = if entry.is_dir { 14 } else { 4 };
+                let label = fit_text(p, &entry.label, theme.font_size, field.right() - label_x - arrow_w);
+                let label_y = y + (ROW_H - theme.font_size as i32) / 2 - 1;
+                p.text(label_x, label_y, &label, theme.font_size, fg);
+                if entry.is_dir {
+                    draw_arrow(p, field.right() - 10, y + ROW_H / 2, fg);
+                }
+                if active && col.lead == Some(i) && col.selected.len() > 1 {
+                    p.focus_rect(row_rect.inset(1), fg);
+                }
+            }
+            if let Some(err) = &col.error {
+                let msg = fit_text(p, err, theme.font_size, field.w - 12);
+                p.text(field.x + 6, field.y + 6, &msg, theme.font_size, theme.disabled_text);
+            }
+            p.restore_clip(saved);
+            if highlight == Some(Highlight::Column(slot)) {
+                let r = field.inset(2);
+                p.stroke_rect(r, theme.highlight_bg);
+                p.stroke_rect(r.inset(1), theme.highlight_bg);
+            }
+            self.columns[slot].bar.paint(p, theme);
+        } else {
+            self.blank_bars[v].paint(p, theme);
+        }
+    }
+
+    fn status_text(&self) -> String {
+        if let Gesture::Drag { paths, target, .. } = &self.gesture {
+            let what = describe(paths);
+            return match target {
+                Some(t) => format!(
+                    "Move {what} to “{}” — hold Ctrl when dropping to copy",
+                    fsops::display_name(&t.dir)
+                ),
+                None => format!("Drag {what} onto a folder"),
+            };
+        }
+        let last = self.columns.last().expect("the root column");
+        match &last.selected[..] {
+            [] => {
+                if let Some(err) = &last.error {
+                    format!("{} — {err}", last.dir.display())
+                } else {
+                    let n = last.entries.len();
+                    let items = if n == 1 { "item" } else { "items" };
+                    format!("{} — {n} {items}", last.dir.display())
+                }
+            }
+            [i] => {
+                let path = last.path_of(*i);
+                match std::fs::metadata(&path) {
+                    Ok(m) => format!("{} — {}", path.display(), fsops::human_size(m.len())),
+                    Err(_) => path.display().to_string(),
+                }
+            }
+            many => format!("{} items selected in {}", many.len(), last.dir.display()),
+        }
+    }
+
+    fn paint_drag_image(&self, p: &mut Painter, theme: &Theme) {
+        let Gesture::Drag { paths, pos, .. } = &self.gesture else {
+            return;
+        };
+        let icon = match &paths[..] {
+            [one] if one.is_dir() => FOLDER_LARGE,
+            [_] => FILE_LARGE,
+            _ => FILES_LARGE,
+        };
+        let icon_rect = Rect::new(pos.x + 8, pos.y + 8, LARGE_ICON, LARGE_ICON);
+        p.draw_svg(&icon, icon_rect);
+        let label = match &paths[..] {
+            [one] => fsops::display_name(one),
+            many => format!("{} items", many.len()),
+        };
+        let label = fit_text(p, &label, theme.font_size, 200);
+        let size = p.measure_text(&label, theme.font_size);
+        let box_rect = Rect::new(
+            icon_rect.x + LARGE_ICON / 2 - size.w / 2 - 3,
+            icon_rect.bottom() + 2,
+            size.w + 6,
+            ROW_H,
+        );
+        p.fill_rect(box_rect, theme.highlight_bg);
+        p.text(
+            box_rect.x + 3,
+            box_rect.y + (ROW_H - theme.font_size as i32) / 2 - 1,
+            &label,
+            theme.font_size,
+            theme.highlight_text,
+        );
+    }
+}
+
+impl Widget for Browser {
+    fn bounds(&self) -> Rect {
+        self.bounds
+    }
+
+    fn layout(&mut self, bounds: Rect) {
+        self.bounds = bounds;
+        self.sync();
+    }
+
+    fn paint(&mut self, p: &mut Painter, theme: &Theme) {
+        self.sync();
+        self.paint_path_view(p, theme);
+        self.hscroll.paint(p, theme);
+        for v in 0..self.visible {
+            self.paint_column(p, theme, v);
+        }
+        let status = self.status_rect();
+        let text = fit_text(p, &self.status_text(), theme.font_size, status.w);
+        p.text(
+            status.x,
+            status.y + (STATUS_H - theme.font_size as i32) / 2 - 1,
+            &text,
+            theme.font_size,
+            theme.text,
+        );
+    }
+
+    fn paint_overlay(&mut self, p: &mut Painter, theme: &Theme) {
+        self.paint_drag_image(p, theme);
+    }
+
+    fn event(&mut self, event: &Event, ctx: &mut EventCtx) {
+        match event {
+            Event::PointerDown {
+                pos,
+                button: MouseButton::Left,
+                modifiers,
+            } => {
+                self.pointer_down(event, *pos, *modifiers, ctx);
+                ctx.request_paint();
+            }
+            Event::PointerMove { pos } => self.pointer_move(event, *pos, ctx),
+            Event::PointerUp {
+                pos,
+                button: MouseButton::Left,
+                modifiers,
+            } => self.pointer_up(event, *pos, *modifiers, ctx),
+            Event::Scroll {
+                pos,
+                delta_x,
+                delta_y,
+            } => self.scroll(*pos, *delta_x, *delta_y, ctx),
+            Event::Tick => {
+                self.hscroll.event(event, ctx);
+                self.follow_hscroll();
+                for col in &mut self.columns {
+                    col.bar.event(event, ctx);
+                }
+                ctx.request_paint();
+            }
+            Event::KeyDown { key, modifiers } => self.key_down(key, *modifiers, ctx),
+            Event::Char { ch, modifiers } if !modifiers.has_command() => {
+                self.type_ahead(*ch, ctx)
+            }
+            Event::DragEnter { pos } | Event::DragMove { pos } => {
+                // Where a drag from another application (or our own, handed
+                // to the desktop and come back) would land.
+                let target = match &self.os_drag {
+                    Some(paths) => self.target_at(*pos, paths, Op::Move),
+                    None => self.raw_target_at(*pos),
+                };
+                if target.is_some() {
+                    ctx.accept_drop();
+                }
+                self.os_hover = target.map(|t| t.highlight);
+                ctx.request_paint();
+            }
+            Event::DragLeave => {
+                self.os_hover = None;
+                ctx.request_paint();
+            }
+            Event::Drop { pos, data } => {
+                self.os_hover = None;
+                if !data.paths.is_empty() {
+                    // Our own drag coming back moves, like one that never
+                    // left; anything else is copied in.
+                    let op = if self.os_drag.as_ref() == Some(&data.paths) {
+                        Op::Move
+                    } else {
+                        Op::Copy
+                    };
+                    if let Some(target) = self.target_at(*pos, &data.paths, op) {
+                        self.transfer(&data.paths, &target.dir, op);
+                    }
+                }
+                self.os_drag = None;
+                ctx.request_paint();
+            }
+            _ => {}
+        }
+    }
+
+    fn captures_pointer(&self) -> bool {
+        !matches!(self.gesture, Gesture::Idle)
+    }
+
+    fn focusable(&self) -> bool {
+        true
+    }
+
+    fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+}
+
+// ============================================================================
+// Helpers.
+// ============================================================================
+
+/// "notes.txt", or "3 items".
+fn describe(paths: &[PathBuf]) -> String {
+    match paths {
+        [one] => format!("“{}”", fsops::display_name(one)),
+        many => format!("{} items", many.len()),
+    }
+}
+
+/// `text`, cut short with an ellipsis if it is wider than `max_w`.
+fn fit_text(p: &Painter, text: &str, size: f32, max_w: i32) -> String {
+    if max_w <= 0 {
+        return String::new();
+    }
+    if p.measure_text(text, size).w <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let candidate: String = chars[..mid].iter().chain(['…'].iter()).collect();
+        if p.measure_text(&candidate, size).w <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    chars[..lo].iter().chain(['…'].iter()).collect()
+}
+
+/// A small right-pointing triangle, 4 px wide and 7 tall, its point at
+/// `(x + 3, cy)` — NeXT's marker for "there's more to the right".
+fn draw_arrow(p: &mut Painter, x: i32, cy: i32, color: Color) {
+    for i in 0..4 {
+        p.v_line(x + i, cy - 3 + i, 7 - 2 * i, color);
+    }
+}
+
+fn wayland_session() -> bool {
+    cfg!(all(unix, not(target_os = "macos")))
+        && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+}

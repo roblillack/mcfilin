@@ -1,0 +1,10 @@
+[package]
+name = "mcfilin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A file viewer with Miller columns, after NeXTSTEP's File Viewer"
+license = "MIT"
+
+[dependencies]
+saudade = { path = "../saudade" }

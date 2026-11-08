@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- 32px document: a white page with a folded top-right corner and text
+       rules, outlined in black. -->
+  <path d="M6 2 H20 L26 8 V30 H6 Z" fill="#000000"/>
+  <path d="M7 3 H19 V9 H25 V29 H7 Z" fill="#ffffff"/>
+  <path d="M20 3.5 L24.5 8 H20 Z" fill="#c0c0c0"/>
+  <rect x="10" y="13" width="12" height="1" fill="#000000"/>
+  <rect x="10" y="16" width="12" height="1" fill="#000000"/>
+  <rect x="10" y="19" width="12" height="1" fill="#000000"/>
+  <rect x="10" y="22" width="8" height="1" fill="#000000"/>
+</svg>

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- 32px manila folder for the path view and drag images: the back with its
+       stepped tab, and the front flap over it, each a black silhouette under a
+       face drawn one unit inside, so the black reads as a 1px outline. -->
+  <path d="M2 6 H12 L14 8 H30 V27 H2 Z" fill="#000000"/>
+  <path d="M3 7 H11.6 L13.6 9 H29 V26 H3 Z" fill="#c5c53a"/>
+  <path d="M2 12 H30 V27 H2 Z" fill="#000000"/>
+  <path d="M3 13 H29 V26 H3 Z" fill="#ffff80"/>
+  <rect x="3" y="13" width="26" height="1" fill="#ffffc8"/>
+</svg>
