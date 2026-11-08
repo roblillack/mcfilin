@@ -226,7 +226,7 @@ fn mode_string(meta: &fs::Metadata) -> String {
 }
 
 #[cfg(unix)]
-fn user_name(uid: u32) -> String {
+pub(crate) fn user_name(uid: u32) -> String {
     let mut buf = vec![0 as libc::c_char; 4096];
     // SAFETY: all pointers point at live, correctly sized storage; on success
     // `pw_name` points into `buf`, which outlives its use here.

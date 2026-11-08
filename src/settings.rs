@@ -1,6 +1,7 @@
 //! What McFilin remembers from one run to the next, in two places:
 //!
-//! - [`Settings`], what the user chose — whether the path view is shown — in
+//! - [`Settings`], what the user chose — whether the shelf and the path view
+//!   are shown — in
 //!   `$XDG_CONFIG_HOME/mcfilin/settings` (by default
 //!   `~/.config/mcfilin/settings`), and
 //! - [`WindowState`], what just happens to be so — the size of the window —
@@ -21,12 +22,13 @@ use std::path::PathBuf;
 /// The user's choices, kept in the config folder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
+    pub shelf: bool,
     pub path_view: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { path_view: true }
+        Self { shelf: true, path_view: true }
     }
 }
 
@@ -43,17 +45,18 @@ impl Settings {
     fn parse(text: &str) -> Self {
         let mut s = Self::default();
         for (key, value) in pairs(text) {
-            if key == "path_view"
-                && let Ok(v) = value.parse()
-            {
-                s.path_view = v;
+            let Ok(v) = value.parse() else { continue };
+            match key {
+                "shelf" => s.shelf = v,
+                "path_view" => s.path_view = v,
+                _ => {}
             }
         }
         s
     }
 
     fn to_text(&self) -> String {
-        format!("path_view = {}\n", self.path_view)
+        format!("shelf = {}\npath_view = {}\n", self.shelf, self.path_view)
     }
 }
 
@@ -109,7 +112,7 @@ fn read(path: Option<PathBuf>) -> String {
 /// Writes `text` to `path`, creating the folder if need be. Written to a
 /// temporary file first and renamed into place, so a crash halfway never
 /// leaves a truncated file.
-fn write(path: Option<PathBuf>, text: &str) -> io::Result<()> {
+pub(crate) fn write(path: Option<PathBuf>, text: &str) -> io::Result<()> {
     let Some(path) = path else { return Ok(()) };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -131,7 +134,7 @@ fn state_file() -> Option<PathBuf> {
 
 /// The base directory `var` names, or `fallback` in the home folder when it
 /// is unset or not absolute, as the XDG Base Directory spec has it.
-fn xdg_dir(var: &str, fallback: &str) -> Option<PathBuf> {
+pub(crate) fn xdg_dir(var: &str, fallback: &str) -> Option<PathBuf> {
     std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -144,7 +147,9 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let s = Settings { path_view: false };
+        let s = Settings { shelf: false, path_view: false };
+        assert_eq!(Settings::parse(&s.to_text()), s);
+        let s = Settings { shelf: false, path_view: true };
         assert_eq!(Settings::parse(&s.to_text()), s);
         assert_eq!(Settings::parse(&Settings::default().to_text()), Settings::default());
         let w = WindowState { size: Some((900, 600)) };
@@ -154,7 +159,7 @@ mod tests {
 
     #[test]
     fn skips_what_it_cannot_read() {
-        let s = Settings::parse("junk\npath_view = maybe\nother = 1\n");
+        let s = Settings::parse("junk\npath_view = maybe\nshelf = 0\nother = 1\n");
         assert_eq!(s, Settings::default());
         let w = WindowState::parse("size = 0x5\nsize\n");
         assert_eq!(w, WindowState::default());

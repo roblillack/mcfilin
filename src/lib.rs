@@ -7,6 +7,7 @@ pub mod fsops;
 pub mod info;
 pub mod mime;
 pub mod settings;
+pub mod shelf;
 pub mod thumbs;
 pub mod trash;
 
@@ -40,6 +41,7 @@ pub fn window(
     let browser = Rc::new_cyclic(|this| {
         RefCell::new(Browser::new(&start, dialog.clone(), this.clone()))
     });
+    browser.borrow_mut().set_shelf_view(settings.shelf);
     browser.borrow_mut().set_path_view(settings.path_view);
 
     // Each menu item borrows the shared browser, does its thing, and repaints.
@@ -91,6 +93,10 @@ pub fn window(
         .add_menu(Menu::new(
             "&View",
             vec![
+                MenuItem::action("Show &Shelf", act(Browser::toggle_shelf_view)).with_checked({
+                    let browser = browser.clone();
+                    move || browser.borrow().shelf_view()
+                }),
                 MenuItem::action("Show &Path", act(Browser::toggle_path_view)).with_checked({
                     let browser = browser.clone();
                     move || browser.borrow().path_view()
@@ -113,6 +119,9 @@ pub fn window(
                 MenuItem::action("&Home", act(Browser::go_home))
                     .with_accel(Accel::primary('h').shift()),
                 MenuItem::action("&Root", act(|b| b.go_to(std::path::Path::new("/")))),
+                MenuItem::separator(),
+                MenuItem::action("&Add to Shelf", act(Browser::add_to_shelf)),
+                MenuItem::action("Re&move from Shelf", act(Browser::remove_from_shelf)),
             ],
         ));
 
@@ -134,7 +143,11 @@ pub fn window(
         let saved = state.size;
         move || {
             let b = root.borrow().bounds();
-            let settings = Settings { path_view: browser.borrow().path_view() };
+            let browser = browser.borrow();
+            let settings = Settings {
+                shelf: browser.shelf_view(),
+                path_view: browser.path_view(),
+            };
             let size = if b.w > 0 && b.h > 0 { Some((b.w, b.h)) } else { saved };
             (settings, WindowState { size })
         }

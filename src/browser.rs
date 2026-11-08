@@ -2,6 +2,8 @@
 //!
 //! From top to bottom the widget shows
 //!
+//! - the **shelf** (see [`crate::shelf`]), the home folder and the user's
+//!   bookmarked folders, unless it is turned off in the View menu,
 //! - the **path view**, one large icon per visible column naming the folder
 //!   that column lists (and, past the last folder, the selected file), unless
 //!   it is turned off in the View menu,
@@ -21,6 +23,11 @@
 //! moves, holding Ctrl or Alt on release copies. On Wayland, dragging past the
 //! window's edge hands the drag to the desktop, so files can be dropped onto
 //! other applications; drops from other applications are copied in.
+//!
+//! A click on the shelf goes to that folder. Folders dropped on the shelf
+//! between its icons are put there; dropped on an icon, files go into that
+//! folder as anywhere else. The icons after the home folder's are dragged to
+//! put them in another order, or off the shelf to take them off it.
 //!
 //! The keyboard works in one column at a time: the arrow keys, Page Up/Down,
 //! Home and End move the selection, and with Shift held extend it from where
@@ -51,6 +58,7 @@ use saudade::{
 use crate::clipboard::Clipboard;
 use crate::fsops::{self, Entry, Op};
 use crate::info::{self, FileInfo};
+use crate::shelf::{self, Shelf};
 use crate::thumbs::{self, Thumb, Thumbnails};
 
 const FOLDER_ICON: SvgImage = include_svg!("assets/icons/folder.svg");
@@ -58,6 +66,7 @@ const FILE_ICON: SvgImage = include_svg!("assets/icons/file.svg");
 const FOLDER_LARGE: SvgImage = include_svg!("assets/icons/folder-large.svg");
 const FILE_LARGE: SvgImage = include_svg!("assets/icons/file-large.svg");
 const FILES_LARGE: SvgImage = include_svg!("assets/icons/files-large.svg");
+const HOME_LARGE: SvgImage = include_svg!("assets/icons/home-large.svg");
 
 /// The narrowest a column gets before the window shows one column fewer.
 pub const MIN_COLUMN_WIDTH: i32 = 170;
@@ -68,6 +77,11 @@ const ROW_PAD_Y: i32 = 2;
 const SMALL_ICON: i32 = 16;
 const LARGE_ICON: i32 = 32;
 const PATH_H: i32 = 64;
+/// The width of a place on the shelf, which narrows down to the least one
+/// to keep them all in a row, and grows a row when they don't fit even so.
+const SHELF_CELL_W: i32 = 84;
+const SHELF_CELL_MIN_W: i32 = 64;
+const SHELF_ROW_H: i32 = 62;
 const STATUS_H: i32 = 20;
 /// How far the pointer must travel from a press before it becomes a drag.
 const DRAG_THRESHOLD: i32 = 5;
@@ -207,11 +221,24 @@ enum Highlight {
     Column(usize),
     /// A folder icon in the path view.
     PathIcon(usize),
+    /// An icon on the shelf, by its place: 0 is the home folder, `i + 1`
+    /// the `i`-th bookmark.
+    ShelfIcon(usize),
+    /// The gap on the shelf before the `i`-th bookmark.
+    ShelfGap(usize),
+}
+
+#[derive(Clone, Debug)]
+enum Dest {
+    /// Move or copy into this folder.
+    Folder(PathBuf),
+    /// Put the folders on the shelf, before the `i`-th bookmark.
+    Shelf(usize),
 }
 
 #[derive(Clone, Debug)]
 struct Target {
-    dir: PathBuf,
+    dest: Dest,
     highlight: Highlight,
 }
 
@@ -235,6 +262,16 @@ enum Gesture {
         pos: Point,
         /// The drop target under the pointer, assuming a move.
         target: Option<Target>,
+    },
+    /// Pressed on the shelf's icon in `place`, not yet moved far enough to
+    /// drag it.
+    ShelfPress { origin: Point, place: usize },
+    /// Dragging the `index`-th bookmark: to the gap before the `gap`-th one,
+    /// or, off the shelf, away.
+    ShelfDrag {
+        index: usize,
+        pos: Point,
+        gap: Option<usize>,
     },
 }
 
@@ -291,7 +328,12 @@ pub struct Browser {
     active: usize,
     focused: bool,
     show_hidden: bool,
+    shelf_view: bool,
     path_view: bool,
+    shelf: Shelf,
+    /// The first place on the shelf: the home folder, named for the user.
+    home: PathBuf,
+    home_label: String,
     hscroll: ScrollBar,
     /// Scroll bars for the empty columns past the end of the path.
     blank_bars: Vec<ScrollBar>,
@@ -337,7 +379,11 @@ impl Browser {
             active: 0,
             focused: false,
             show_hidden: false,
+            shelf_view: true,
             path_view: true,
+            shelf: Shelf::load(),
+            home: std::env::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+            home_label: shelf::user_name(),
             hscroll: ScrollBar::horizontal(Rect::new(0, 0, 0, 0)),
             blank_bars: Vec::new(),
             gesture: Gesture::Idle,
@@ -440,8 +486,30 @@ impl Browser {
 
     pub fn set_path_view(&mut self, shown: bool) {
         self.path_view = shown;
-        // The columns get shorter or taller: keep the selections in sight.
-        // (Before the first layout, `reveal_pending` sees to that.)
+        self.keep_leads_in_sight();
+    }
+
+    pub fn toggle_path_view(&mut self) {
+        self.set_path_view(!self.path_view);
+    }
+
+    pub fn shelf_view(&self) -> bool {
+        self.shelf_view
+    }
+
+    pub fn set_shelf_view(&mut self, shown: bool) {
+        self.shelf_view = shown;
+        self.keep_leads_in_sight();
+    }
+
+    pub fn toggle_shelf_view(&mut self) {
+        self.set_shelf_view(!self.shelf_view);
+    }
+
+    /// After the columns got shorter or taller, scrolls them to keep their
+    /// selections in sight. (Before the first layout, `reveal_pending` sees
+    /// to that.)
+    fn keep_leads_in_sight(&mut self) {
         if self.columns_rect().h == 0 {
             return;
         }
@@ -454,8 +522,94 @@ impl Browser {
         self.sync();
     }
 
-    pub fn toggle_path_view(&mut self) {
-        self.set_path_view(!self.path_view);
+    // ------------------------------------------------------------------
+    // The shelf.
+    // ------------------------------------------------------------------
+
+    /// The folder in a place on the shelf.
+    fn shelf_path(&self, place: usize) -> Option<PathBuf> {
+        match place {
+            0 => Some(self.home.clone()),
+            p => self.shelf.get(p - 1).map(|b| b.path.clone()),
+        }
+    }
+
+    fn shelf_label(&self, place: usize) -> String {
+        match place {
+            0 => self.home_label.clone(),
+            p => self.shelf.get(p - 1).map(|b| b.label()).unwrap_or_default(),
+        }
+    }
+
+    /// What Add to Shelf and Remove from Shelf act on: the folders selected
+    /// in the active column, or, with nothing selected there, its own folder.
+    fn shelf_subject(&self) -> Vec<PathBuf> {
+        let col = &self.columns[self.active_slot()];
+        if col.selected.is_empty() {
+            return vec![col.dir.clone()];
+        }
+        col.selected
+            .iter()
+            .filter(|&&i| col.entries[i].is_dir)
+            .map(|&i| col.path_of(i))
+            .collect()
+    }
+
+    pub fn add_to_shelf(&mut self) {
+        let paths = self.shelf_subject();
+        self.shelve(&paths, self.shelf.len());
+    }
+
+    pub fn remove_from_shelf(&mut self) {
+        let mut changed = false;
+        for path in self.shelf_subject() {
+            if let Some(i) = self.shelf.position(&path) {
+                changed |= self.shelf.remove(i);
+            }
+        }
+        self.shelf_changed(changed);
+    }
+
+    /// Whether dropping `paths` between the shelf's icons would put anything
+    /// there: they must all be folders, and not all there already.
+    fn can_shelve(&self, paths: &[PathBuf]) -> bool {
+        !paths.is_empty()
+            && paths.iter().all(|p| p.is_dir())
+            && paths.iter().any(|p| *p != self.home && !self.shelf.contains(p))
+    }
+
+    /// Puts the folders among `paths` on the shelf, before the `at`-th
+    /// bookmark.
+    fn shelve(&mut self, paths: &[PathBuf], at: usize) {
+        let folders: Vec<PathBuf> = paths
+            .iter()
+            .filter(|p| p.is_dir() && **p != self.home)
+            .cloned()
+            .collect();
+        let added = self.shelf.insert(at, &folders) > 0;
+        self.shelf_changed(added);
+    }
+
+    /// Saves the shelf if it `changed`; the columns may have a new height.
+    fn shelf_changed(&mut self, changed: bool) {
+        if !changed {
+            return;
+        }
+        if let Err(e) = self.shelf.save() {
+            self.show_errors("Couldn't save the shelf", &[e.to_string()]);
+        }
+        self.keep_leads_in_sight();
+    }
+
+    /// A click on the shelf: show that folder.
+    fn go_to_place(&mut self, place: usize) {
+        let Some(path) = self.shelf_path(place) else { return };
+        if path.is_dir() {
+            self.go_to(&path);
+        } else {
+            let name = self.shelf_label(place);
+            self.show_errors("Couldn't open", &[format!("“{name}” isn't there any more")]);
+        }
     }
 
     /// Re-reads every column from disk, keeping selections by name and closing
@@ -918,11 +1072,80 @@ impl Browser {
         self.columns.len() + files as usize
     }
 
+    fn shelf_cell_w(&self) -> i32 {
+        let room = self.bounds.w - 2 * MARGIN - 2;
+        (room / (1 + self.shelf.len()) as i32).clamp(SHELF_CELL_MIN_W, SHELF_CELL_W)
+    }
+
+    /// How many places the shelf has room for in a row.
+    fn shelf_per_row(&self) -> usize {
+        ((self.bounds.w - 2 * MARGIN - 2) / self.shelf_cell_w()).max(1) as usize
+    }
+
+    /// The shelf's area, a row of places high or more as they need: no
+    /// height at all while it is turned off.
+    fn shelf_rect(&self) -> Rect {
+        let b = self.bounds;
+        let rows = (1 + self.shelf.len()).div_ceil(self.shelf_per_row()) as i32;
+        let h = if self.shelf_view { rows * SHELF_ROW_H + 2 } else { 0 };
+        Rect::new(b.x + MARGIN, b.y + MARGIN, (b.w - 2 * MARGIN).max(0), h)
+    }
+
+    /// The `place`-th place on the shelf, inside its border.
+    fn shelf_cell(&self, place: usize) -> Rect {
+        let area = self.shelf_rect();
+        let per_row = self.shelf_per_row();
+        let (row, col) = ((place / per_row) as i32, (place % per_row) as i32);
+        let w = self.shelf_cell_w();
+        Rect::new(area.x + 1 + col * w, area.y + 1 + row * SHELF_ROW_H, w, SHELF_ROW_H)
+    }
+
+    /// Where the icon of a place on the shelf is drawn.
+    fn shelf_icon_rect(cell: Rect) -> Rect {
+        Rect::new(cell.x + (cell.w - LARGE_ICON) / 2, cell.y + 6, LARGE_ICON, LARGE_ICON)
+    }
+
+    /// The place on the shelf under `pos`.
+    fn shelf_place_at(&self, pos: Point) -> Option<usize> {
+        if !self.shelf_rect().contains(pos) {
+            return None;
+        }
+        (0..=self.shelf.len()).find(|&p| self.shelf_cell(p).contains(pos))
+    }
+
+    /// The gap on the shelf nearest `pos` — the one before the `i`-th
+    /// bookmark — for something dropped there. The home folder stays first.
+    fn shelf_gap_at(&self, pos: Point) -> Option<usize> {
+        let area = self.shelf_rect();
+        if !area.contains(pos) {
+            return None;
+        }
+        let n = self.shelf.len();
+        let per_row = self.shelf_per_row();
+        let row = ((pos.y - area.y - 1) / SHELF_ROW_H).max(0) as usize;
+        let cell_w = self.shelf_cell_w();
+        let dx = (pos.x - area.x - 1).max(0);
+        let col = (dx / cell_w) as usize;
+        let place = row * per_row + col.min(per_row - 1);
+        if place > n {
+            return Some(n); // past the last icon
+        }
+        // Over the right half of a place, or past the end of its row, the
+        // gap after it; the gap after place `p` is the one before bookmark `p`.
+        let after = col >= per_row || dx % cell_w >= cell_w / 2;
+        Some(if after { place } else { place.saturating_sub(1) })
+    }
+
     /// The path view's area: no height at all while it is turned off.
     fn path_rect(&self) -> Rect {
         let b = self.bounds;
+        let top = if self.shelf_view {
+            self.shelf_rect().bottom() + MARGIN
+        } else {
+            b.y + MARGIN
+        };
         let h = if self.path_view { PATH_H } else { 0 };
-        Rect::new(b.x + MARGIN, b.y + MARGIN, (b.w - 2 * MARGIN).max(0), h)
+        Rect::new(b.x + MARGIN, top, (b.w - 2 * MARGIN).max(0), h)
     }
 
     /// The scroller's area, sharing its top edge with the path view's bottom
@@ -938,7 +1161,7 @@ impl Browser {
         let top = if self.path_view {
             self.hscroll_rect().bottom() + MARGIN
         } else {
-            b.y + MARGIN
+            self.path_rect().y
         };
         let bottom = b.bottom() - STATUS_H;
         Rect::new(b.x + MARGIN, top, (b.w - 2 * MARGIN).max(0), (bottom - top).max(0))
@@ -1096,35 +1319,55 @@ impl Browser {
         })
     }
 
-    /// The folder under `pos` that would take a drop, whatever is dragged.
+    /// What under `pos` would take a drop, whatever is dragged: a folder, or
+    /// a gap on the shelf.
     fn raw_target_at(&self, pos: Point) -> Option<Target> {
+        let folder = |dir: PathBuf, highlight| Some(Target { dest: Dest::Folder(dir), highlight });
+        if self.shelf_rect().contains(pos) {
+            // The middle of a place is its icon; around it, the gaps.
+            if let Some(place) = self.shelf_place_at(pos) {
+                let cell = self.shelf_cell(place);
+                let icon = Rect::new(cell.x + cell.w / 4, cell.y, cell.w / 2, cell.h);
+                if icon.contains(pos) {
+                    return folder(self.shelf_path(place)?, Highlight::ShelfIcon(place));
+                }
+            }
+            let gap = self.shelf_gap_at(pos)?;
+            return Some(Target {
+                dest: Dest::Shelf(gap),
+                highlight: Highlight::ShelfGap(gap),
+            });
+        }
         if self.path_rect().contains(pos) {
             let slot = self.path_slot_at(pos)?;
             let col = self.columns.get(slot)?;
-            return Some(Target {
-                dir: col.dir.clone(),
-                highlight: Highlight::PathIcon(slot),
-            });
+            return folder(col.dir.clone(), Highlight::PathIcon(slot));
         }
         let slot = self.column_slot_at(pos)?;
         let col = self.columns.get(slot)?;
         if let Some(row) = self.row_at(slot, pos)
             && col.entries[row].is_dir
         {
-            return Some(Target {
-                dir: col.path_of(row),
-                highlight: Highlight::Row(slot, row),
-            });
+            return folder(col.path_of(row), Highlight::Row(slot, row));
         }
-        Some(Target {
-            dir: col.dir.clone(),
-            highlight: Highlight::Column(slot),
-        })
+        folder(col.dir.clone(), Highlight::Column(slot))
     }
 
     fn target_at(&self, pos: Point, paths: &[PathBuf], op: Op) -> Option<Target> {
-        self.raw_target_at(pos)
-            .filter(|t| fsops::can_drop(paths, &t.dir, op))
+        self.raw_target_at(pos).filter(|t| match &t.dest {
+            Dest::Folder(dir) => fsops::can_drop(paths, dir, op),
+            Dest::Shelf(_) => self.can_shelve(paths),
+        })
+    }
+
+    /// Drops `paths` on `target`.
+    fn drop_on(&mut self, target: Target, paths: &[PathBuf], op: Op) {
+        match target.dest {
+            Dest::Folder(dir) => {
+                self.transfer(paths, &dir, op);
+            }
+            Dest::Shelf(at) => self.shelve(paths, at),
+        }
     }
 
     fn highlight(&self) -> Option<&Highlight> {
@@ -1144,6 +1387,12 @@ impl Browser {
             self.hscroll.event(event, ctx);
             self.gesture = Gesture::HScroll;
             self.follow_hscroll();
+            return;
+        }
+        if self.shelf_rect().contains(pos) {
+            if let Some(place) = self.shelf_place_at(pos) {
+                self.gesture = Gesture::ShelfPress { origin: pos, place };
+            }
             return;
         }
         if let Some(slot) = self.path_slot_at(pos) {
@@ -1239,6 +1488,27 @@ impl Browser {
                     self.gesture = Gesture::Drag { paths, pos, target };
                 }
             }
+            Gesture::ShelfPress { origin, place } => {
+                let (dx, dy) = (pos.x - origin.x, pos.y - origin.y);
+                if dx * dx + dy * dy >= DRAG_THRESHOLD * DRAG_THRESHOLD {
+                    self.gesture = match *place {
+                        // The home folder stays where it is; nor is it a click.
+                        0 => Gesture::Idle,
+                        place => Gesture::ShelfDrag {
+                            index: place - 1,
+                            pos,
+                            gap: self.shelf_gap_at(pos),
+                        },
+                    };
+                }
+            }
+            Gesture::ShelfDrag { .. } => {
+                let new_gap = self.shelf_gap_at(pos);
+                if let Gesture::ShelfDrag { pos: p, gap, .. } = &mut self.gesture {
+                    *p = pos;
+                    *gap = new_gap;
+                }
+            }
             Gesture::Drag { .. } => {
                 if !self.window_rect().contains(pos) && wayland_session() {
                     // Off the window: hand the drag to the desktop so it can
@@ -1293,8 +1563,16 @@ impl Browser {
                     Op::Move
                 };
                 if let Some(target) = self.target_at(pos, &paths, op) {
-                    self.transfer(&paths, &target.dir, op);
+                    self.drop_on(target, &paths, op);
                 }
+            }
+            Gesture::ShelfPress { place, .. } => self.go_to_place(place),
+            Gesture::ShelfDrag { index, gap, .. } => {
+                let changed = match gap {
+                    Some(gap) => self.shelf.move_to(index, gap),
+                    None => self.shelf.remove(index),
+                };
+                self.shelf_changed(changed);
             }
         }
         ctx.request_paint();
@@ -1445,6 +1723,44 @@ impl Browser {
     // ------------------------------------------------------------------
     // Painting.
     // ------------------------------------------------------------------
+
+    fn paint_shelf(&mut self, p: &mut Painter, theme: &Theme) {
+        // A sunken frame, but no fill: the window's background shows through.
+        let area = self.shelf_rect();
+        p.sunken_bevel(area, theme.highlight, theme.shadow);
+        let saved = p.push_clip_frame(area, 1, Merged::NONE);
+        let highlight = self.highlight().cloned();
+        for place in 0..=self.shelf.len() {
+            let cell = self.shelf_cell(place);
+            let icon = Self::shelf_icon_rect(cell);
+            if highlight == Some(Highlight::ShelfIcon(place)) {
+                p.fill_rect(icon.inset(-3), theme.highlight_bg);
+            }
+            let (image, there) = match place {
+                0 => (HOME_LARGE, true),
+                _ => (FOLDER_LARGE, self.shelf_path(place).is_some_and(|p| p.is_dir())),
+            };
+            p.draw_svg(&image, icon);
+            let label = fit_text(p, &self.shelf_label(place), theme.font_size, cell.w - 6);
+            let w = p.measure_text(&label, theme.font_size).w;
+            // A folder that's gone — deleted, or on a disk not mounted —
+            // stays on the shelf, greyed out.
+            let color = if there { theme.text } else { theme.disabled_text };
+            p.text(cell.x + (cell.w - w) / 2, icon.bottom() + 5, &label, theme.font_size, color);
+        }
+        // Where something dropped would go: a bar after the place before it.
+        let gap = match (&self.gesture, highlight) {
+            (Gesture::ShelfDrag { gap, .. }, _) => *gap,
+            (_, Some(Highlight::ShelfGap(gap))) => Some(gap),
+            _ => None,
+        };
+        if let Some(gap) = gap {
+            let cell = self.shelf_cell(gap);
+            let x = (cell.right() - 1).min(area.right() - 3);
+            p.fill_rect(Rect::new(x, cell.y + 4, 2, cell.h - 8), theme.highlight_bg);
+        }
+        p.restore_clip(saved);
+    }
 
     fn paint_path_view(&mut self, p: &mut Painter, theme: &Theme) {
         let area = self.path_rect();
@@ -1713,12 +2029,20 @@ impl Browser {
     fn status_text(&self) -> String {
         if let Gesture::Drag { paths, target, .. } = &self.gesture {
             let what = describe(paths);
-            return match target {
-                Some(t) => format!(
+            return match target.as_ref().map(|t| &t.dest) {
+                Some(Dest::Folder(dir)) => format!(
                     "Move {what} to “{}” — hold Ctrl when dropping to copy",
-                    fsops::display_name(&t.dir)
+                    fsops::display_name(dir)
                 ),
+                Some(Dest::Shelf(_)) => format!("Put {what} on the shelf"),
                 None => format!("Drag {what} onto a folder"),
+            };
+        }
+        if let Gesture::ShelfDrag { index, gap, .. } = &self.gesture {
+            let name = self.shelf_label(index + 1);
+            return match gap {
+                Some(_) => format!("Move “{name}” along the shelf — drag it off to take it off"),
+                None => format!("Take “{name}” off the shelf"),
             };
         }
         let last = self.columns.last().expect("the root column");
@@ -1744,20 +2068,26 @@ impl Browser {
     }
 
     fn paint_drag_image(&self, p: &mut Painter, theme: &Theme) {
-        let Gesture::Drag { paths, pos, .. } = &self.gesture else {
-            return;
-        };
-        let icon = match &paths[..] {
-            [one] if one.is_dir() => FOLDER_LARGE,
-            [_] => FILE_LARGE,
-            _ => FILES_LARGE,
+        let (icon, label, pos) = match &self.gesture {
+            Gesture::Drag { paths, pos, .. } => {
+                let icon = match &paths[..] {
+                    [one] if one.is_dir() => FOLDER_LARGE,
+                    [_] => FILE_LARGE,
+                    _ => FILES_LARGE,
+                };
+                let label = match &paths[..] {
+                    [one] => fsops::display_name(one),
+                    many => format!("{} items", many.len()),
+                };
+                (icon, label, pos)
+            }
+            Gesture::ShelfDrag { index, pos, .. } => {
+                (FOLDER_LARGE, self.shelf_label(index + 1), pos)
+            }
+            _ => return,
         };
         let icon_rect = Rect::new(pos.x + 8, pos.y + 8, LARGE_ICON, LARGE_ICON);
         p.draw_svg(&icon, icon_rect);
-        let label = match &paths[..] {
-            [one] => fsops::display_name(one),
-            many => format!("{} items", many.len()),
-        };
         let label = fit_text(p, &label, theme.font_size, 200);
         let size = p.measure_text(&label, theme.font_size);
         let box_rect = Rect::new(
@@ -1789,9 +2119,15 @@ impl Widget for Browser {
 
     fn paint(&mut self, p: &mut Painter, theme: &Theme) {
         self.flush_errors();
+        if self.shelf_view && self.shelf.refresh() {
+            self.keep_leads_in_sight();
+        }
         self.sync();
         self.scale = p.scale();
         self.refresh_preview();
+        if self.shelf_view {
+            self.paint_shelf(p, theme);
+        }
         if self.path_view {
             self.paint_path_view(p, theme);
             self.hscroll.paint(p, theme);
@@ -1916,7 +2252,7 @@ impl Browser {
                         Op::Copy
                     };
                     if let Some(target) = self.target_at(*pos, &data.paths, op) {
-                        self.transfer(&data.paths, &target.dir, op);
+                        self.drop_on(target, &data.paths, op);
                     }
                 }
                 self.os_drag = None;

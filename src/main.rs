@@ -2,8 +2,8 @@
 //!
 //! Usage: `mcfilin [PATH]` — opens at PATH, or the home folder.
 //!
-//! The window comes back the size it was closed at, with the path view shown
-//! or not as it was then (see [`mcfilin::settings`]).
+//! The window comes back the size it was closed at, with the shelf and the
+//! path view shown or not as they were then (see [`mcfilin::settings`]).
 
 use std::io;
 use std::path::PathBuf;
