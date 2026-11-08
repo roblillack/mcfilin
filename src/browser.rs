@@ -9,6 +9,10 @@
 //!   with its scroll bar on the right, and
 //! - a **status line**.
 //!
+//! When the last column has files selected, the column past it shows what
+//! there is to know about them: a thumbnail (see [`crate::thumbs`]), the file
+//! type, size, dates, permissions, and owner.
+//!
 //! Selecting a folder in a column opens the next column for it; the view keeps
 //! the end of the path in sight. Items are dragged with the mouse onto a folder
 //! row, a column (its folder), or a folder icon in the path view: a plain drop
@@ -23,11 +27,14 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use saudade::{
-    Color, Dialog, DragData, Event, EventCtx, Key, Merged, Modifiers, MouseButton, NamedKey,
-    Painter, Point, Rect, SCROLLBAR_THICKNESS, ScrollBar, SvgImage, Theme, Widget, include_svg,
+    Color, Dialog, DragData, Event, EventCtx, FontFamily, FontStyle, Key, Merged, Modifiers,
+    MouseButton, NamedKey, Painter, Point, Rect, SCROLLBAR_THICKNESS, ScrollBar, Size, SvgImage,
+    Theme, Widget, include_svg,
 };
 
 use crate::fsops::{self, Entry, Op};
+use crate::info::{self, FileInfo};
+use crate::thumbs::{self, Thumb, Thumbnails};
 
 const FOLDER_ICON: SvgImage = include_svg!("assets/icons/folder.svg");
 const FILE_ICON: SvgImage = include_svg!("assets/icons/file.svg");
@@ -50,6 +57,9 @@ const DRAG_THRESHOLD: i32 = 5;
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// How long typed letters keep adding up to one type-ahead search.
 const TYPE_AHEAD: Duration = Duration::from_millis(1000);
+/// The largest a thumbnail is shown in the info column, in logical pixels.
+const PREVIEW_MAX: i32 = 192;
+const INFO_PAD: i32 = 8;
 
 // ============================================================================
 // One column: the listing of a folder plus its selection and scroll position.
@@ -221,6 +231,12 @@ enum Click {
     PathIcon(usize),
 }
 
+/// What the info column shows for the selected files.
+enum Preview {
+    One(FileInfo),
+    Many(Vec<(&'static str, String)>),
+}
+
 /// What sits in one slot of the path view.
 struct SlotInfo {
     icon: SvgImage,
@@ -263,6 +279,16 @@ pub struct Browser {
     os_hover: Option<Highlight>,
     /// Lead rows still to be scrolled into view once the columns have a size.
     reveal_pending: bool,
+    /// The selection the info column describes, and what it says about it.
+    preview_key: Vec<PathBuf>,
+    preview: Option<Preview>,
+    /// How far the info column is scrolled down, and how tall its content
+    /// came out on the last paint.
+    info_scroll: i32,
+    info_height: i32,
+    thumbs: Thumbnails,
+    /// The display scale of the last paint, to ask for thumbnails sharp enough.
+    scale: f32,
     dialog: Rc<RefCell<Dialog>>,
 }
 
@@ -285,6 +311,12 @@ impl Browser {
             os_drag: None,
             os_hover: None,
             reveal_pending: false,
+            preview_key: Vec::new(),
+            preview: None,
+            info_scroll: 0,
+            info_height: 0,
+            thumbs: Thumbnails::new(),
+            scale: 1.0,
             dialog,
         };
         me.go_to(start);
@@ -365,6 +397,8 @@ impl Browser {
     /// Re-reads every column from disk, keeping selections by name and closing
     /// columns whose folder is gone.
     pub fn reload(&mut self) {
+        // The selected files may have changed too.
+        self.preview_key.clear();
         let mut i = 0;
         while i < self.columns.len() {
             if i > 0 && !self.columns[i].dir.is_dir() {
@@ -902,6 +936,9 @@ impl Browser {
             };
             self.hscroll.event(&ev, ctx);
             self.follow_hscroll();
+        } else if self.column_slot_at(pos) == Some(self.columns.len()) && self.preview.is_some() {
+            // The info column scrolls by the pixel.
+            self.info_scroll = (self.info_scroll + (delta_y * ROW_H as f32) as i32).max(0);
         } else if let Some(slot) = self.column_slot_at(pos)
             && let Some(col) = self.columns.get_mut(slot)
         {
@@ -1102,9 +1139,166 @@ impl Browser {
                 p.stroke_rect(r.inset(1), theme.highlight_bg);
             }
             self.columns[slot].bar.paint(p, theme);
+        } else if slot == self.columns.len() && self.preview.is_some() {
+            self.paint_info(p, theme, cell);
         } else {
             self.blank_bars[v].paint(p, theme);
         }
+    }
+
+    /// Brings the info column up to date with the selection of the last
+    /// column, and asks for the thumbnail it shows.
+    fn refresh_preview(&mut self) {
+        let key = self
+            .columns
+            .last()
+            .map(BrowserColumn::selected_paths)
+            .unwrap_or_default();
+        if key != self.preview_key {
+            self.preview = match &key[..] {
+                [] => None,
+                [one] => FileInfo::gather(one).map(Preview::One),
+                many => Some(Preview::Many(info::summarize(many))),
+            };
+            self.preview_key = key;
+            self.info_scroll = 0;
+        }
+        if let Some(Preview::One(info)) = &self.preview
+            && !info.is_dir
+        {
+            let size = thumbs::Size::for_pixels(PREVIEW_MAX as f32 * self.scale);
+            self.thumbs.get(&info.path, &info.mime, info.mtime, size);
+        }
+    }
+
+    /// The info column: thumbnail or icon, name, and a table of facts.
+    fn paint_info(&mut self, p: &mut Painter, theme: &Theme, field: Rect) {
+        p.fill_rect(field, theme.background);
+        p.sunken_bevel(field, theme.highlight, theme.shadow);
+        p.stroke_rect(field, theme.border);
+        let Some(preview) = &self.preview else {
+            return;
+        };
+        let saved = p.push_clip_frame(field, 1, Merged::NONE);
+        let x = field.x + INFO_PAD;
+        let inner_w = (field.w - 2 * INFO_PAD).max(0);
+        self.info_scroll = self.info_scroll.min(self.info_height - field.h).max(0);
+        let top = field.y + INFO_PAD + 4 - self.info_scroll;
+        let mut y = top;
+        let font = theme.font_size;
+        let line_h = (font * 1.45).round() as i32;
+
+        // The picture: a thumbnail, or the type's icon while there is none.
+        let (thumb, icon, name, rows) = match preview {
+            Preview::One(info) => {
+                let thumb = if info.is_dir {
+                    None
+                } else {
+                    let size = thumbs::Size::for_pixels(PREVIEW_MAX as f32 * self.scale);
+                    match self.thumbs.get(&info.path, &info.mime, info.mtime, size) {
+                        Thumb::Ready(img) => Some(img.clone()),
+                        _ => None,
+                    }
+                };
+                let icon = if info.is_dir { FOLDER_LARGE } else { FILE_LARGE };
+                (thumb, icon, info.name.clone(), &info.rows)
+            }
+            Preview::Many(rows) => (
+                None,
+                FILES_LARGE,
+                format!("{} items", self.preview_key.len()),
+                rows,
+            ),
+        };
+        match thumb {
+            Some(img) => {
+                let side = inner_w.min(PREVIEW_MAX).min((field.h * 2 / 5).max(48));
+                let (w, h) = (img.width as i32, img.height as i32);
+                // Fit the box, but never past the thumbnail's own size.
+                let f = (side as f32 / w.max(h) as f32).min(1.0);
+                let (dw, dh) = (
+                    ((w as f32 * f).round() as i32).max(1),
+                    ((h as f32 * f).round() as i32).max(1),
+                );
+                let rect = Rect::new(field.x + (field.w - dw) / 2, y, dw, dh);
+                let flat = flatten(&img.pixels, theme.background);
+                p.draw_resampled(rect, Size::new(w, h), 1.0, theme.background, |q| {
+                    q.blit_argb(0, 0, img.width, img.height, &flat)
+                });
+                p.stroke_rect(rect.inset(-1), theme.shadow);
+                y += dh + 10;
+            }
+            None => {
+                let size = 48;
+                p.draw_svg(&icon, Rect::new(field.x + (field.w - size) / 2, y, size, size));
+                y += size + 8;
+            }
+        }
+
+        // The name, bold and centered, wrapped as needed.
+        let bold = |p: &Painter, s: &str| {
+            p.measure_text_styled(s, font, FontFamily::Sans, FontStyle::Bold).w
+        };
+        let lines: Vec<String> = p
+            .wrap_text_styled(&name, font, inner_w, FontFamily::Sans, FontStyle::Bold)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for line in lines {
+            let w = bold(p, &line);
+            p.text_styled(
+                field.x + (field.w - w) / 2,
+                y,
+                &line,
+                font,
+                theme.text,
+                FontFamily::Sans,
+                FontStyle::Bold,
+            );
+            y += line_h;
+        }
+        y += 8;
+
+        // The facts: labels right-aligned against their values — or, where
+        // the column is too narrow for a date beside its label, each label
+        // above its value.
+        let label_w = rows
+            .iter()
+            .map(|(k, _)| p.measure_text(&format!("{k}:"), font).w)
+            .max()
+            .unwrap_or(0);
+        let beside = inner_w - label_w - 6 >= p.measure_text("0000-00-00 00:00", font).w;
+        let (value_x, gap) = if beside {
+            (x + label_w + 6, 2)
+        } else {
+            (x + 8, 6)
+        };
+        let value_w = (field.right() - INFO_PAD - value_x).max(1);
+        for (label, value) in rows {
+            let label = format!("{label}:");
+            if beside {
+                let lw = p.measure_text(&label, font).w;
+                p.text(x + label_w - lw, y, &label, font, theme.disabled_text);
+            } else {
+                p.text(x, y, &label, font, theme.disabled_text);
+                y += line_h;
+            }
+            let lines: Vec<String> = p
+                .wrap_text(value, font, value_w)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            for line in &lines {
+                p.text(value_x, y, line, font, theme.text);
+                y += line_h;
+            }
+            if lines.is_empty() {
+                y += line_h;
+            }
+            y += gap;
+        }
+        self.info_height = y - top + 2 * INFO_PAD;
+        p.restore_clip(saved);
     }
 
     fn status_text(&self) -> String {
@@ -1186,6 +1380,8 @@ impl Widget for Browser {
 
     fn paint(&mut self, p: &mut Painter, theme: &Theme) {
         self.sync();
+        self.scale = p.scale();
+        self.refresh_preview();
         self.paint_path_view(p, theme);
         self.hscroll.paint(p, theme);
         for v in 0..self.visible {
@@ -1207,6 +1403,31 @@ impl Widget for Browser {
     }
 
     fn event(&mut self, event: &Event, ctx: &mut EventCtx) {
+        self.handle(event, ctx);
+        // Ask for the thumbnail now, not at paint time, so the runtime sees
+        // `wants_ticks` and keeps polling until it arrives.
+        self.refresh_preview();
+    }
+
+    fn wants_ticks(&self) -> bool {
+        self.thumbs.pending()
+    }
+
+    fn captures_pointer(&self) -> bool {
+        !matches!(self.gesture, Gesture::Idle)
+    }
+
+    fn focusable(&self) -> bool {
+        true
+    }
+
+    fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+}
+
+impl Browser {
+    fn handle(&mut self, event: &Event, ctx: &mut EventCtx) {
         match event {
             Event::PointerDown {
                 pos,
@@ -1228,6 +1449,7 @@ impl Widget for Browser {
                 delta_y,
             } => self.scroll(*pos, *delta_x, *delta_y, ctx),
             Event::Tick => {
+                self.thumbs.poll();
                 self.hscroll.event(event, ctx);
                 self.follow_hscroll();
                 for col in &mut self.columns {
@@ -1276,23 +1498,24 @@ impl Widget for Browser {
             _ => {}
         }
     }
-
-    fn captures_pointer(&self) -> bool {
-        !matches!(self.gesture, Gesture::Idle)
-    }
-
-    fn focusable(&self) -> bool {
-        true
-    }
-
-    fn set_focused(&mut self, focused: bool) {
-        self.focused = focused;
-    }
 }
 
 // ============================================================================
 // Helpers.
 // ============================================================================
+
+/// `pixels` (straight-alpha ARGB) composited over `bg`, opaque.
+fn flatten(pixels: &[u32], bg: Color) -> Vec<u32> {
+    let blend = |s: u32, d: u32, a: u32| (s * a + d * (255 - a) + 127) / 255;
+    pixels
+        .iter()
+        .map(|&px| {
+            let a = px >> 24;
+            let ch = |shift: u32| blend((px >> shift) & 0xff, (bg.0 >> shift) & 0xff, a) << shift;
+            0xff00_0000 | ch(16) | ch(8) | ch(0)
+        })
+        .collect()
+}
 
 /// "notes.txt", or "3 items".
 fn describe(paths: &[PathBuf]) -> String {

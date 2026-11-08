@@ -8,3 +8,10 @@ license = "MIT"
 
 [dependencies]
 saudade = { path = "../saudade" }
+# Thumbnails: the cache names them by the MD5 of the file's URI, and they are PNGs.
+md-5 = "0.10"
+png = "0.17"
+
+[target.'cfg(unix)'.dependencies]
+# Local time, and user / group names, for the info column.
+libc = "0.2"

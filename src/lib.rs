@@ -3,6 +3,9 @@
 
 pub mod browser;
 pub mod fsops;
+pub mod info;
+pub mod mime;
+pub mod thumbs;
 
 use std::cell::RefCell;
 use std::path::PathBuf;

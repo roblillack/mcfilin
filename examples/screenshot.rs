@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use saudade::mock::MockBackend;
-use saudade::{Event, Font, Modifiers, MouseButton, Point, WindowChrome};
+use saudade::{Event, Font, Modifiers, MouseButton, Point, Widget, WindowChrome};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -34,6 +34,13 @@ fn main() {
             };
             backend.dispatch(&mut root, &ev);
         }
+    }
+    // Let background work (thumbnails) finish, as the live app's ticks would.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    backend.render(&mut root);
+    while root.wants_ticks() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        backend.dispatch(&mut root, &Event::Tick);
     }
     let snap = backend.render_framed(&mut root, &WindowChrome::resizable("McFilin"));
     std::fs::write(out, snap.to_png()).unwrap();
