@@ -1,10 +1,22 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <!-- 32px manila folder for the path view and drag images: the back with its
-       stepped tab, and the front flap over it, each a black silhouette under a
-       face drawn one unit inside, so the black reads as a 1px outline. -->
-  <path d="M2 6 H12 L14 8 H30 V27 H2 Z" fill="#000000"/>
-  <path d="M3 7 H11.6 L13.6 9 H29 V26 H3 Z" fill="#c5c53a"/>
-  <path d="M2 12 H30 V27 H2 Z" fill="#000000"/>
-  <path d="M3 13 H29 V26 H3 Z" fill="#ffff80"/>
-  <rect x="3" y="13" width="26" height="1" fill="#ffffc8"/>
+  <!-- 32px manila folder for the shelf, the path view and drag images: the
+       back with its stepped tab, a sheet of paper tucked in, and the front
+       flap over them, each a black silhouette under a face drawn one unit
+       inside, so the black reads as a 1px outline. The faces are lit from
+       the top left: a pale line along those edges, a darker one along the
+       bottom and right. -->
+  <path d="M2 4 H12 L14 6 H30 V27 H2 Z" fill="#000000"/>
+  <path d="M3 5 H11.6 L13.6 7 H29 V26 H3 Z" fill="#c5c53a"/>
+  <path d="M3 5 H11.6 L13.6 7 H29 V8 H13.2 L11.2 6 H4 V13 H3 Z" fill="#e8e878"/>
+  <rect x="28" y="8" width="1" height="5" fill="#a0a020"/>
+  <rect x="7" y="8" width="18" height="6" fill="#000000"/>
+  <rect x="8" y="9" width="16" height="4" fill="#ffffff"/>
+  <rect x="10" y="10" width="11" height="1" fill="#909090"/>
+  <rect x="10" y="12" width="8" height="1" fill="#909090"/>
+  <path d="M2 13 H30 V27 H2 Z" fill="#000000"/>
+  <path d="M3 14 H29 V26 H3 Z" fill="#ffff80"/>
+  <rect x="3" y="14" width="26" height="1" fill="#ffffd8"/>
+  <rect x="3" y="15" width="1" height="11" fill="#ffffd8"/>
+  <rect x="4" y="25" width="25" height="1" fill="#d0d048"/>
+  <rect x="28" y="15" width="1" height="10" fill="#d0d048"/>
 </svg>
