@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=McFilin
+GenericName=File Viewer
+Comment=Browse files in Miller columns, after NeXTSTEP's File Viewer
+Exec=mcfilin %f
+Icon=mcfilin
+Terminal=false
+Categories=System;FileTools;FileManager;
+Keywords=files;folders;browser;miller;columns;
+MimeType=inode/directory;
+StartupWMClass=mcfilin
