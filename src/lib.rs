@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 use saudade::{
     Accel, Column, Dialog, Event, EventCtx, Menu, MenuBar, MenuItem, NamedKey, Painter,
-    PopupRequest, Rect, Theme, Widget, WindowConfig,
+    PopupRequest, Rect, SvgImage, Theme, Widget, WindowConfig, include_svg,
 };
 
 use browser::{Browser, MIN_COLUMN_WIDTH};
@@ -28,6 +28,9 @@ const WINDOW_H: i32 = 480;
 const MENU_BAR_H: i32 = 20;
 const MIN_W: i32 = MIN_COLUMN_WIDTH * 2 + 40;
 const MIN_H: i32 = 280;
+
+/// The program's icon, for the title bar, the taskbar and the dock.
+const ICON: SvgImage = include_svg!("assets/icons/mcfilin.svg");
 
 /// The main window and its widget tree, opened at `start` the way `settings`
 /// and `state` have it — along with a function that tells the settings and
@@ -134,6 +137,7 @@ pub fn window(
 
     let (w, h) = state.size.unwrap_or((WINDOW_W, WINDOW_H));
     let config = WindowConfig::new("McFilin", w.max(MIN_W), h.max(MIN_H))
+        .icon(ICON)
         .resizable(true)
         .min_size(MIN_W, MIN_H);
 
