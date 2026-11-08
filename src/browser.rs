@@ -24,7 +24,9 @@
 //! Delete moves it to the trash, Shift+Delete deletes it for good once
 //! confirmed, and F2 edits the name of a single selected item in place —
 //! Enter, or a click elsewhere, renames it; Escape leaves it as it was. A new
-//! folder starts out with its name being edited.
+//! folder starts out with its name being edited. Cut and Copy put the
+//! selection on the clipboard (see [`crate::clipboard`]); Paste brings it into
+//! the current folder — the last column's — and selects what arrived.
 
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
@@ -38,6 +40,7 @@ use saudade::{
     TextInput, Theme, Widget, include_svg,
 };
 
+use crate::clipboard::Clipboard;
 use crate::fsops::{self, Entry, Op};
 use crate::info::{self, FileInfo};
 use crate::thumbs::{self, Thumb, Thumbnails};
@@ -312,6 +315,7 @@ pub struct Browser {
     /// This browser, for dialogs that act on it once confirmed.
     this: Weak<RefCell<Browser>>,
     rename: Option<Rename>,
+    clipboard: Clipboard,
 }
 
 impl Browser {
@@ -343,6 +347,7 @@ impl Browser {
             errors: Vec::new(),
             this,
             rename: None,
+            clipboard: Clipboard::new(),
         };
         me.go_to(start);
         me
@@ -523,17 +528,40 @@ impl Browser {
 
     /// Selects `path` in the column listing its folder, if one does.
     fn select_path(&mut self, path: &Path) -> bool {
-        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        self.select_paths(std::slice::from_ref(&path.to_path_buf()))
+    }
+
+    /// Selects `paths`, all in one folder, in the column listing it, if one
+    /// does.
+    fn select_paths(&mut self, paths: &[PathBuf]) -> bool {
+        let Some(dir) = paths.first().and_then(|p| p.parent()) else {
             return false;
         };
-        let slot = self.columns.iter().position(|c| c.dir == dir);
-        if let Some(slot) = slot
-            && let Some(row) = self.columns[slot].index_of(name)
-        {
-            self.select_row(slot, row);
+        let Some(slot) = self.columns.iter().position(|c| c.dir == dir) else {
+            return false;
+        };
+        let col = &self.columns[slot];
+        let mut rows: Vec<usize> = paths
+            .iter()
+            .filter(|p| p.parent() == Some(dir))
+            .filter_map(|p| col.index_of(p.file_name()?))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
+            return false;
+        };
+        if rows.len() == 1 {
+            self.select_row(slot, first);
             return true;
         }
-        false
+        let col = &mut self.columns[slot];
+        col.anchor = Some(first);
+        col.lead = Some(last);
+        let n = self.rows_per_column();
+        self.columns[slot].scroll_to(last, n);
+        self.set_selection(slot, rows);
+        true
     }
 
     // ------------------------------------------------------------------
@@ -656,14 +684,54 @@ impl Browser {
         true
     }
 
-    fn transfer(&mut self, paths: &[PathBuf], dest: &Path, op: Op) {
-        let (_, errors) = fsops::transfer(paths, dest, op);
+    /// Moves or copies `paths` into `dest` and returns where they ended up.
+    fn transfer(&mut self, paths: &[PathBuf], dest: &Path, op: Op) -> Vec<PathBuf> {
+        let (done, errors) = fsops::transfer(paths, dest, op);
         self.reload();
         let title = match op {
             Op::Move => "Couldn't move",
             Op::Copy => "Couldn't copy",
         };
         self.show_errors(title, &errors);
+        done
+    }
+
+    pub fn cut(&mut self) {
+        self.put_on_clipboard(Op::Move);
+    }
+
+    pub fn copy(&mut self) {
+        self.put_on_clipboard(Op::Copy);
+    }
+
+    fn put_on_clipboard(&mut self, op: Op) {
+        let paths = self.columns[self.active_slot()].selected_paths();
+        if !paths.is_empty() {
+            self.clipboard.put(paths, op);
+        }
+    }
+
+    /// Brings what was cut or copied into the current folder.
+    pub fn paste(&mut self) {
+        let Some((paths, op)) = self.clipboard.contents() else {
+            return;
+        };
+        let dest = self.current_dir().to_path_buf();
+        if !fsops::can_drop(&paths, &dest, op) {
+            if op == Op::Move && paths.iter().all(|p| p.parent() == Some(&dest)) {
+                return; // cut and pasted back where they are
+            }
+            self.show_errors(
+                "Couldn't paste",
+                &[format!("{} can't go into “{}”", describe(&paths), fsops::display_name(&dest))],
+            );
+            return;
+        }
+        let done = self.transfer(&paths, &dest, op);
+        if op == Op::Move && !done.is_empty() {
+            self.clipboard.clear_cut();
+        }
+        self.select_paths(&done);
     }
 
     /// The column the keyboard is in, whose selection the file operations
@@ -1347,6 +1415,9 @@ impl Browser {
                     (theme.highlight_text, Some(theme.highlight_bg))
                 } else if selected {
                     (theme.text, Some(theme.face))
+                } else if self.clipboard.is_cut(&col.path_of(i)) {
+                    // Cut, waiting to be pasted elsewhere.
+                    (theme.disabled_text, None)
                 } else {
                     (theme.text, None)
                 };

@@ -12,6 +12,13 @@ saudade = { path = "../saudade" }
 md-5 = "0.10"
 png = "0.17"
 
+# Cut, Copy and Paste of files through the system clipboard, configured as
+# saudade has it.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+arboard = { version = "3", default-features = false }
+
 [target.'cfg(unix)'.dependencies]
 # Local time, and user / group names, for the info column.
 libc = "0.2"

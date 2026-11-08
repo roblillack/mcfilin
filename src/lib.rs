@@ -2,6 +2,7 @@
 //! built on the Saudade GUI toolkit.
 
 pub mod browser;
+pub mod clipboard;
 pub mod fsops;
 pub mod info;
 pub mod mime;
@@ -59,6 +60,14 @@ pub fn window(start: PathBuf) -> (WindowConfig, impl Widget) {
                     .with_accel(Accel::new(NamedKey::Delete).shift()),
                 MenuItem::separator(),
                 MenuItem::action("&Quit", |cx| cx.close()).with_accel(Accel::primary('q')),
+            ],
+        ))
+        .add_menu(Menu::new(
+            "&Edit",
+            vec![
+                MenuItem::action("Cu&t", act(Browser::cut)).with_accel(Accel::primary('x')),
+                MenuItem::action("&Copy", act(Browser::copy)).with_accel(Accel::primary('c')),
+                MenuItem::action("&Paste", act(Browser::paste)).with_accel(Accel::primary('v')),
             ],
         ))
         .add_menu(Menu::new(
