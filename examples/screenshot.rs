@@ -20,6 +20,7 @@ fn main() {
         backend = backend.with_sans_font(font);
     }
     backend.render(&mut root); // lays the tree out
+    root.focus_first(); // as the runtime does after the first layout
     // Optional scripted events from $EVENTS, separated by ";":
     // "down X Y", "move X Y", "up X Y" for the mouse (prefix the verb with
     // modifiers like "shift+down X Y"), "key [MODS+]KEY" for a key press
