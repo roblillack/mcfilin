@@ -19,11 +19,15 @@
 //! moves, holding Ctrl or Alt on release copies. On Wayland, dragging past the
 //! window's edge hands the drag to the desktop, so files can be dropped onto
 //! other applications; drops from other applications are copied in.
+//!
+//! The file operations act on the selection of the column the keyboard is in:
+//! Delete moves it to the trash, Shift+Delete deletes it for good once
+//! confirmed.
 
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use saudade::{
@@ -290,10 +294,15 @@ pub struct Browser {
     /// The display scale of the last paint, to ask for thumbnails sharp enough.
     scale: f32,
     dialog: Rc<RefCell<Dialog>>,
+    /// Errors still to be shown, `(title, message)`, waiting for the dialog
+    /// to be free.
+    errors: Vec<(String, String)>,
+    /// This browser, for dialogs that act on it once confirmed.
+    this: Weak<RefCell<Browser>>,
 }
 
 impl Browser {
-    pub fn new(start: &Path, dialog: Rc<RefCell<Dialog>>) -> Self {
+    pub fn new(start: &Path, dialog: Rc<RefCell<Dialog>>, this: Weak<RefCell<Browser>>) -> Self {
         let mut me = Self {
             bounds: Rect::new(0, 0, 0, 0),
             columns: Vec::new(),
@@ -318,6 +327,8 @@ impl Browser {
             thumbs: Thumbnails::new(),
             scale: 1.0,
             dialog,
+            errors: Vec::new(),
+            this,
         };
         me.go_to(start);
         me
@@ -508,9 +519,93 @@ impl Browser {
         self.show_errors(title, &errors);
     }
 
-    fn show_errors(&self, title: &str, errors: &[String]) {
+    /// The column the keyboard is in, whose selection the file operations
+    /// act on.
+    fn active_slot(&self) -> usize {
+        self.active.min(self.columns.len() - 1)
+    }
+
+    pub fn move_to_trash(&mut self) {
+        let slot = self.active_slot();
+        let paths = self.columns[slot].selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let errors = fsops::trash(&paths);
+        self.after_removal(slot);
+        self.show_errors("Couldn't move to the Trash", &errors);
+    }
+
+    /// Asks before deleting the selection of the active column for good.
+    pub fn delete_immediately(&mut self) {
+        let slot = self.active_slot();
+        let paths = self.columns[slot].selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let message = format!(
+            "Delete {} immediately? This can't be undone.",
+            describe(&paths)
+        );
+        let this = self.this.clone();
+        self.dialog
+            .borrow_mut()
+            .show_confirm("Delete Immediately", message, "Delete", move |cx| {
+                if let Some(browser) = this.upgrade() {
+                    let mut browser = browser.borrow_mut();
+                    let errors = fsops::delete(&paths);
+                    // The selection may have moved on while the box was up.
+                    let slot = browser
+                        .columns
+                        .iter()
+                        .position(|c| paths.first().and_then(|p| p.parent()) == Some(&c.dir))
+                        .unwrap_or_else(|| browser.active_slot());
+                    browser.after_removal(slot);
+                    browser.show_errors("Couldn't delete", &errors);
+                }
+                cx.request_paint();
+            });
+    }
+
+    /// Re-reads the folders after the selection of the column in `slot` was
+    /// trashed or deleted, and selects the entry that took the place of the
+    /// first one gone, so the keyboard can carry on from there.
+    fn after_removal(&mut self, slot: usize) {
+        let first = self.columns[slot].selected.first().copied();
+        self.reload();
+        if slot >= self.columns.len() {
+            return;
+        }
+        let col = &self.columns[slot];
+        if let Some(row) = first
+            && col.selected.is_empty()
+            && !col.entries.is_empty()
+        {
+            self.select_row(slot, row.min(col.entries.len() - 1));
+        } else {
+            self.active = slot;
+            self.reveal_end();
+        }
+    }
+
+    fn show_errors(&mut self, title: &str, errors: &[String]) {
         if !errors.is_empty() {
-            self.dialog.borrow_mut().show_error(title, errors.join("\n"));
+            self.errors.push((title.to_string(), errors.join("\n")));
+        }
+        self.flush_errors();
+    }
+
+    /// Shows the next waiting error, unless the dialog is busy — open, or in
+    /// the middle of running the confirmed action that failed.
+    fn flush_errors(&mut self) {
+        if self.errors.is_empty() {
+            return;
+        }
+        if let Ok(mut dialog) = self.dialog.try_borrow_mut()
+            && !dialog.is_open()
+        {
+            let (title, message) = self.errors.remove(0);
+            dialog.show_error(title, message);
         }
     }
 
@@ -1379,6 +1474,7 @@ impl Widget for Browser {
     }
 
     fn paint(&mut self, p: &mut Painter, theme: &Theme) {
+        self.flush_errors();
         self.sync();
         self.scale = p.scale();
         self.refresh_preview();

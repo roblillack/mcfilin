@@ -133,27 +133,10 @@ fn group_digits(n: u64) -> String {
 
 /// A time as local "YYYY-MM-DD HH:MM".
 pub fn format_time(t: SystemTime) -> String {
-    let secs = match t.duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        Err(e) => -(e.duration().as_secs() as i64),
-    };
-    #[cfg(unix)]
-    {
-        let time = secs as libc::time_t;
-        // SAFETY: `tm` is plain old data that `localtime_r` fills in; both
-        // pointers are valid for the call.
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        if !unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
-            return format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}",
-                tm.tm_year + 1900,
-                tm.tm_mon + 1,
-                tm.tm_mday,
-                tm.tm_hour,
-                tm.tm_min
-            );
-        }
+    if let Some((y, mo, d, h, mi, _)) = local_parts(t) {
+        return format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}");
     }
+    let secs = epoch_secs(t);
     // UTC, from the days since the epoch (Howard Hinnant's civil_from_days).
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
@@ -171,6 +154,38 @@ pub fn format_time(t: SystemTime) -> String {
         rem / 3600,
         rem % 3600 / 60
     )
+}
+
+fn epoch_secs(t: SystemTime) -> i64 {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    }
+}
+
+/// A time in the local time zone: year, month, day, hour, minute, second.
+/// `None` where the system can't say.
+pub fn local_parts(t: SystemTime) -> Option<(i32, i32, i32, i32, i32, i32)> {
+    #[cfg(unix)]
+    {
+        let time = epoch_secs(t) as libc::time_t;
+        // SAFETY: `tm` is plain old data that `localtime_r` fills in; both
+        // pointers are valid for the call.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if !unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
+            return Some((
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec,
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = t;
+    None
 }
 
 /// `ls -l`'s "-rwxr-xr-x".

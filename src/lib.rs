@@ -6,6 +6,7 @@ pub mod fsops;
 pub mod info;
 pub mod mime;
 pub mod thumbs;
+pub mod trash;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -25,7 +26,9 @@ const MENU_BAR_H: i32 = 20;
 /// The main window and its widget tree, opened at `start`.
 pub fn window(start: PathBuf) -> (WindowConfig, impl Widget) {
     let dialog = Rc::new(RefCell::new(Dialog::new()));
-    let browser = Rc::new(RefCell::new(Browser::new(&start, dialog.clone())));
+    let browser = Rc::new_cyclic(|this| {
+        RefCell::new(Browser::new(&start, dialog.clone(), this.clone()))
+    });
 
     // Each menu item borrows the shared browser, does its thing, and repaints.
     let act = |f: fn(&mut Browser)| {
@@ -44,6 +47,11 @@ pub fn window(start: PathBuf) -> (WindowConfig, impl Widget) {
                     .with_accel(Accel::primary('o')),
                 MenuItem::action("&New Folder", act(Browser::new_folder))
                     .with_accel(Accel::primary('n').shift()),
+                MenuItem::separator(),
+                MenuItem::action("Move to &Trash", act(Browser::move_to_trash))
+                    .with_accel(Accel::new(NamedKey::Delete)),
+                MenuItem::action("&Delete Immediately…", act(Browser::delete_immediately))
+                    .with_accel(Accel::new(NamedKey::Delete).shift()),
                 MenuItem::separator(),
                 MenuItem::action("&Quit", |cx| cx.close()).with_accel(Accel::primary('q')),
             ],

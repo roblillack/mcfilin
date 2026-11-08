@@ -1,6 +1,7 @@
 //! Everything McFilin does to the filesystem: reading a directory into the
 //! entries a browser column shows, moving and copying files for a drop,
-//! creating folders, and handing a file to the desktop to open.
+//! creating folders, trashing and deleting, and handing a file to the desktop
+//! to open.
 
 use std::ffi::OsString;
 use std::fs;
@@ -185,6 +186,25 @@ fn copy_recursive(src: &Path, target: &Path) -> io::Result<()> {
     }
 }
 
+/// Moves each of `paths` to the trash. Returns a message for each that
+/// couldn't be; one failure doesn't stop the others.
+pub fn trash(paths: &[PathBuf]) -> Vec<String> {
+    for_each(paths, crate::trash::trash)
+}
+
+/// Deletes each of `paths` for good, folders with everything in them.
+/// Returns a message for each that couldn't be.
+pub fn delete(paths: &[PathBuf]) -> Vec<String> {
+    for_each(paths, remove_recursive)
+}
+
+fn for_each(paths: &[PathBuf], f: impl Fn(&Path) -> io::Result<()>) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(|p| f(p).err().map(|e| format!("{}: {e}", display_name(p))))
+        .collect()
+}
+
 fn remove_recursive(path: &Path) -> io::Result<()> {
     if path.symlink_metadata()?.is_dir() {
         fs::remove_dir_all(path)
@@ -329,6 +349,19 @@ mod tests {
         assert_eq!(done, [b.join("file.txt")]);
         assert!(!file.exists());
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn deletes_files_and_folders() {
+        let dir = scratch("delete");
+        fs::create_dir_all(dir.join("a/b")).unwrap();
+        fs::write(dir.join("a/b/f"), "").unwrap();
+        fs::write(dir.join("g"), "").unwrap();
+        let errors = delete(&[dir.join("a"), dir.join("g"), dir.join("missing")]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("missing: "));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 
