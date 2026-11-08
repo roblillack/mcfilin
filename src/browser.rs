@@ -24,8 +24,9 @@
 //! window's edge hands the drag to the desktop, so files can be dropped onto
 //! other applications; drops from other applications are copied in.
 //!
-//! A click on the shelf goes to that folder. Folders dropped on the shelf
-//! between its icons are put there; dropped on an icon, files go into that
+//! A click on the shelf goes to that folder, as does its item in the Go menu,
+//! where the first ten places have Ctrl+1 … Ctrl+0. Folders dropped on the
+//! shelf between its icons are put there; dropped on an icon, files go into that
 //! folder as anywhere else. The icons after the home folder's are dragged to
 //! put them in another order, or off the shelf to take them off it.
 //!
@@ -50,9 +51,9 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use saudade::{
-    Color, Dialog, DragData, Event, EventCtx, FontFamily, FontStyle, Key, Merged, Modifiers,
-    MouseButton, NamedKey, Painter, Point, Rect, SCROLLBAR_THICKNESS, ScrollBar, Size, SvgImage,
-    TextInput, Theme, Widget, include_svg,
+    Accel, Color, Dialog, DragData, Event, EventCtx, FontFamily, FontStyle, Key, Merged,
+    ModifierScheme, Modifiers, MouseButton, NamedKey, Painter, Point, Rect, SCROLLBAR_THICKNESS,
+    ScrollBar, Size, SvgImage, TextInput, Theme, Widget, include_svg,
 };
 
 use crate::clipboard::Clipboard;
@@ -601,8 +602,22 @@ impl Browser {
         self.keep_leads_in_sight();
     }
 
-    /// A click on the shelf: show that folder.
-    fn go_to_place(&mut self, place: usize) {
+    /// The labels of the bookmarks on the shelf, after home — re-reading them
+    /// if another program changed them.
+    pub fn bookmark_labels(&mut self) -> Vec<String> {
+        self.refresh_shelf();
+        self.shelf.bookmarks().map(|b| b.label()).collect()
+    }
+
+    /// Picks up changes another program made to the bookmarks.
+    fn refresh_shelf(&mut self) {
+        if self.shelf.refresh() && self.shelf_view {
+            self.keep_leads_in_sight();
+        }
+    }
+
+    /// A click on the shelf, or its item in the Go menu: show that folder.
+    pub fn go_to_place(&mut self, place: usize) {
         let Some(path) = self.shelf_path(place) else { return };
         if path.is_dir() {
             self.go_to(&path);
@@ -1654,11 +1669,15 @@ impl Browser {
 
     fn key_down(&mut self, key: &Key, mods: Modifiers, ctx: &mut EventCtx) {
         if mods.control || mods.alt || mods.logo {
-            if let Key::Named(NamedKey::Up) = key {
-                self.go_parent();
-                ctx.request_paint();
+            let home = Accel::primary('h').shift();
+            match key {
+                Key::Named(NamedKey::Up) => self.go_parent(),
+                // Home's chord from before the Go menu listed the shelf.
+                _ if home.matches(*key, mods, ModifierScheme::native()) => self.go_home(),
+                _ => return, // the menu bar's accelerators
             }
-            return; // the menu bar's accelerators
+            ctx.request_paint();
+            return;
         }
         let slot = self.active.min(self.columns.len() - 1);
         let len = self.columns[slot].entries.len();
@@ -2119,9 +2138,7 @@ impl Widget for Browser {
 
     fn paint(&mut self, p: &mut Painter, theme: &Theme) {
         self.flush_errors();
-        if self.shelf_view && self.shelf.refresh() {
-            self.keep_leads_in_sight();
-        }
+        self.refresh_shelf();
         self.sync();
         self.scale = p.scale();
         self.refresh_preview();

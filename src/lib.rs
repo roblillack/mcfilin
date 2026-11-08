@@ -47,19 +47,145 @@ pub fn window(
     browser.borrow_mut().set_shelf_view(settings.shelf);
     browser.borrow_mut().set_path_view(settings.path_view);
 
-    // Each menu item borrows the shared browser, does its thing, and repaints.
-    // A name being edited is settled first, as a click elsewhere would.
-    let act = |f: fn(&mut Browser)| {
-        let browser = browser.clone();
-        move |cx: &mut EventCtx| {
-            let mut browser = browser.borrow_mut();
-            browser.finish_rename();
-            f(&mut browser);
-            cx.request_paint();
+    let menu_bar = Menus::new(browser.clone());
+    let root = Rc::new(RefCell::new(
+        Column::new()
+            .add_fixed(menu_bar, MENU_BAR_H)
+            .add_fill(Shared(browser.clone()))
+            .add_overlay(Shared(dialog)),
+    ));
+
+    let (w, h) = state.size.unwrap_or((WINDOW_W, WINDOW_H));
+    let config = WindowConfig::new("McFilin", w.max(MIN_W), h.max(MIN_H))
+        .icon(ICON)
+        .resizable(true)
+        .min_size(MIN_W, MIN_H);
+
+    // The root is laid out at the window's size, so its bounds are that size.
+    let current = {
+        let root = root.clone();
+        let saved = state.size;
+        move || {
+            let b = root.borrow().bounds();
+            let browser = browser.borrow();
+            let settings = Settings {
+                shelf: browser.shelf_view(),
+                path_view: browser.path_view(),
+            };
+            let size = if b.w > 0 && b.h > 0 { Some((b.w, b.h)) } else { saved };
+            (settings, WindowState { size })
         }
     };
+    (config, Shared(root), current)
+}
 
-    let menu_bar = MenuBar::new(Rect::new(0, 0, WINDOW_W, MENU_BAR_H))
+/// The menu bar, built anew whenever the places on the shelf change so the Go
+/// menu lists them.
+struct Menus {
+    bar: MenuBar,
+    browser: Rc<RefCell<Browser>>,
+    /// The labels of the bookmarks the Go menu lists now.
+    bookmarks: Vec<String>,
+}
+
+impl Menus {
+    fn new(browser: Rc<RefCell<Browser>>) -> Self {
+        let bookmarks = browser.borrow_mut().bookmark_labels();
+        let bar = menu_bar(&browser, &bookmarks);
+        Self { bar, browser, bookmarks }
+    }
+
+    /// Rebuilds the bar if the shelf changed — but not while a menu is open.
+    fn sync(&mut self) {
+        if self.bar.captures_pointer() {
+            return;
+        }
+        let bookmarks = self.browser.borrow_mut().bookmark_labels();
+        if bookmarks != self.bookmarks {
+            let bounds = self.bar.bounds();
+            self.bar = menu_bar(&self.browser, &bookmarks);
+            self.bar.layout(bounds);
+            self.bookmarks = bookmarks;
+        }
+    }
+}
+
+impl Widget for Menus {
+    fn bounds(&self) -> Rect {
+        self.bar.bounds()
+    }
+    fn paint(&mut self, painter: &mut Painter, theme: &Theme) {
+        self.sync();
+        self.bar.paint(painter, theme);
+    }
+    fn paint_overlay(&mut self, painter: &mut Painter, theme: &Theme) {
+        self.bar.paint_overlay(painter, theme);
+    }
+    fn event(&mut self, event: &Event, ctx: &mut EventCtx) {
+        if let Event::KeyDown { .. } | Event::PointerDown { .. } = event {
+            self.sync();
+        }
+        self.bar.event(event, ctx);
+    }
+    fn on_cancel(&mut self, ctx: &mut EventCtx) {
+        self.bar.on_cancel(ctx);
+    }
+    fn captures_pointer(&self) -> bool {
+        self.bar.captures_pointer()
+    }
+    fn accepts_accelerators(&self) -> bool {
+        self.bar.accepts_accelerators()
+    }
+    fn layout(&mut self, bounds: Rect) {
+        self.bar.layout(bounds);
+    }
+    fn popup_request(&self) -> Option<PopupRequest> {
+        self.bar.popup_request()
+    }
+}
+
+/// A menu item's callback: borrows the shared browser, does its thing, and
+/// repaints. A name being edited is settled first, as a click elsewhere would.
+fn on_browser(
+    browser: &Rc<RefCell<Browser>>,
+    f: impl Fn(&mut Browser) + 'static,
+) -> impl FnMut(&mut EventCtx) + 'static {
+    let browser = browser.clone();
+    move |cx| {
+        let mut browser = browser.borrow_mut();
+        browser.finish_rename();
+        f(&mut browser);
+        cx.request_paint();
+    }
+}
+
+/// The menu bar. The Go menu lists the places on the shelf — home, then the
+/// `bookmarks` by their labels — the first ten by Ctrl+1 … Ctrl+0.
+fn menu_bar(browser: &Rc<RefCell<Browser>>, bookmarks: &[String]) -> MenuBar {
+    let act = |f: fn(&mut Browser)| on_browser(browser, f);
+
+    let mut go = vec![
+        MenuItem::action("&Enclosing Folder", act(Browser::go_parent))
+            .with_accel(Accel::primary(NamedKey::Up)),
+        MenuItem::action("&Root", act(|b| b.go_to(std::path::Path::new("/")))),
+        MenuItem::separator(),
+    ];
+    let escaped = bookmarks.iter().map(|b| b.replace('&', "&&"));
+    for (place, label) in std::iter::once("&Home".to_string()).chain(escaped).enumerate() {
+        let mut item = MenuItem::action(label, on_browser(browser, move |b| b.go_to_place(place)));
+        if place < 10 {
+            let digit = char::from(b'0' + ((place + 1) % 10) as u8);
+            item = item.with_accel(Accel::primary(digit));
+        }
+        go.push(item);
+    }
+    go.extend([
+        MenuItem::separator(),
+        MenuItem::action("&Add to Shelf", act(Browser::add_to_shelf)),
+        MenuItem::action("Re&move from Shelf", act(Browser::remove_from_shelf)),
+    ]);
+
+    MenuBar::new(Rect::new(0, 0, WINDOW_W, MENU_BAR_H))
         .add_menu(Menu::new(
             "&File",
             vec![
@@ -114,49 +240,7 @@ pub fn window(
                     .with_accel(Accel::primary('r')),
             ],
         ))
-        .add_menu(Menu::new(
-            "&Go",
-            vec![
-                MenuItem::action("&Enclosing Folder", act(Browser::go_parent))
-                    .with_accel(Accel::primary(NamedKey::Up)),
-                MenuItem::action("&Home", act(Browser::go_home))
-                    .with_accel(Accel::primary('h').shift()),
-                MenuItem::action("&Root", act(|b| b.go_to(std::path::Path::new("/")))),
-                MenuItem::separator(),
-                MenuItem::action("&Add to Shelf", act(Browser::add_to_shelf)),
-                MenuItem::action("Re&move from Shelf", act(Browser::remove_from_shelf)),
-            ],
-        ));
-
-    let root = Rc::new(RefCell::new(
-        Column::new()
-            .add_fixed(menu_bar, MENU_BAR_H)
-            .add_fill(Shared(browser.clone()))
-            .add_overlay(Shared(dialog)),
-    ));
-
-    let (w, h) = state.size.unwrap_or((WINDOW_W, WINDOW_H));
-    let config = WindowConfig::new("McFilin", w.max(MIN_W), h.max(MIN_H))
-        .icon(ICON)
-        .resizable(true)
-        .min_size(MIN_W, MIN_H);
-
-    // The root is laid out at the window's size, so its bounds are that size.
-    let current = {
-        let root = root.clone();
-        let saved = state.size;
-        move || {
-            let b = root.borrow().bounds();
-            let browser = browser.borrow();
-            let settings = Settings {
-                shelf: browser.shelf_view(),
-                path_view: browser.path_view(),
-            };
-            let size = if b.w > 0 && b.h > 0 { Some((b.w, b.h)) } else { saved };
-            (settings, WindowState { size })
-        }
-    };
-    (config, Shared(root), current)
+        .add_menu(Menu::new("&Go", go))
 }
 
 /// A widget shared with the menu callbacks: the column owns this handle, the
