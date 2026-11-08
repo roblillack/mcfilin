@@ -14,7 +14,7 @@ fn main() {
     let out = args.next().expect("OUT.png");
     let w: i32 = args.next().map_or(760, |s| s.parse().unwrap());
     let h: i32 = args.next().map_or(480, |s| s.parse().unwrap());
-    let (_config, mut root) = mcfilin::window(start);
+    let (_config, mut root, _) = mcfilin::window(start, &Default::default(), &Default::default());
     let mut backend = MockBackend::new(w, h).with_scale(2.0);
     if let Some(font) = Font::load_sans() {
         backend = backend.with_sans_font(font);

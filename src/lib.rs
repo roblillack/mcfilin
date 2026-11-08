@@ -6,6 +6,7 @@ pub mod clipboard;
 pub mod fsops;
 pub mod info;
 pub mod mime;
+pub mod settings;
 pub mod thumbs;
 pub mod trash;
 
@@ -19,17 +20,27 @@ use saudade::{
 };
 
 use browser::{Browser, MIN_COLUMN_WIDTH};
+use settings::{Settings, WindowState};
 
 const WINDOW_W: i32 = 760;
 const WINDOW_H: i32 = 480;
 const MENU_BAR_H: i32 = 20;
+const MIN_W: i32 = MIN_COLUMN_WIDTH * 2 + 40;
+const MIN_H: i32 = 280;
 
-/// The main window and its widget tree, opened at `start`.
-pub fn window(start: PathBuf) -> (WindowConfig, impl Widget) {
+/// The main window and its widget tree, opened at `start` the way `settings`
+/// and `state` have it — along with a function that tells the settings and
+/// state the window has now, to be saved once it has closed.
+pub fn window(
+    start: PathBuf,
+    settings: &Settings,
+    state: &WindowState,
+) -> (WindowConfig, impl Widget + use<>, impl Fn() -> (Settings, WindowState) + use<>) {
     let dialog = Rc::new(RefCell::new(Dialog::new()));
     let browser = Rc::new_cyclic(|this| {
         RefCell::new(Browser::new(&start, dialog.clone(), this.clone()))
     });
+    browser.borrow_mut().set_path_view(settings.path_view);
 
     // Each menu item borrows the shared browser, does its thing, and repaints.
     // A name being edited is settled first, as a click elsewhere would.
@@ -80,6 +91,10 @@ pub fn window(start: PathBuf) -> (WindowConfig, impl Widget) {
         .add_menu(Menu::new(
             "&View",
             vec![
+                MenuItem::action("Show &Path", act(Browser::toggle_path_view)).with_checked({
+                    let browser = browser.clone();
+                    move || browser.borrow().path_view()
+                }),
                 MenuItem::action("Show &Hidden Files", act(Browser::toggle_hidden))
                     .with_accel(Accel::primary('h'))
                     .with_checked({
@@ -101,15 +116,30 @@ pub fn window(start: PathBuf) -> (WindowConfig, impl Widget) {
             ],
         ));
 
-    let root = Column::new()
-        .add_fixed(menu_bar, MENU_BAR_H)
-        .add_fill(Shared(browser))
-        .add_overlay(Shared(dialog));
+    let root = Rc::new(RefCell::new(
+        Column::new()
+            .add_fixed(menu_bar, MENU_BAR_H)
+            .add_fill(Shared(browser.clone()))
+            .add_overlay(Shared(dialog)),
+    ));
 
-    let config = WindowConfig::new("McFilin", WINDOW_W, WINDOW_H)
+    let (w, h) = state.size.unwrap_or((WINDOW_W, WINDOW_H));
+    let config = WindowConfig::new("McFilin", w.max(MIN_W), h.max(MIN_H))
         .resizable(true)
-        .min_size(MIN_COLUMN_WIDTH * 2 + 40, 280);
-    (config, root)
+        .min_size(MIN_W, MIN_H);
+
+    // The root is laid out at the window's size, so its bounds are that size.
+    let current = {
+        let root = root.clone();
+        let saved = state.size;
+        move || {
+            let b = root.borrow().bounds();
+            let settings = Settings { path_view: browser.borrow().path_view() };
+            let size = if b.w > 0 && b.h > 0 { Some((b.w, b.h)) } else { saved };
+            (settings, WindowState { size })
+        }
+    };
+    (config, Shared(root), current)
 }
 
 /// A widget shared with the menu callbacks: the column owns this handle, the

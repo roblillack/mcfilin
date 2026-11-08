@@ -3,8 +3,10 @@
 //! From top to bottom the widget shows
 //!
 //! - the **path view**, one large icon per visible column naming the folder
-//!   that column lists (and, past the last folder, the selected file),
-//! - a horizontal **scroller** that pans the columns along the path,
+//!   that column lists (and, past the last folder, the selected file), unless
+//!   it is turned off in the View menu,
+//! - a horizontal **scroller** that pans the columns along the path, shown
+//!   and hidden along with the path view,
 //! - the **columns**, as many as fit the window at [`MIN_COLUMN_WIDTH`], each
 //!   with its scroll bar on the right, and
 //! - a **status line**.
@@ -289,6 +291,7 @@ pub struct Browser {
     active: usize,
     focused: bool,
     show_hidden: bool,
+    path_view: bool,
     hscroll: ScrollBar,
     /// Scroll bars for the empty columns past the end of the path.
     blank_bars: Vec<ScrollBar>,
@@ -334,6 +337,7 @@ impl Browser {
             active: 0,
             focused: false,
             show_hidden: false,
+            path_view: true,
             hscroll: ScrollBar::horizontal(Rect::new(0, 0, 0, 0)),
             blank_bars: Vec::new(),
             gesture: Gesture::Idle,
@@ -428,6 +432,30 @@ impl Browser {
     pub fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
         self.reload();
+    }
+
+    pub fn path_view(&self) -> bool {
+        self.path_view
+    }
+
+    pub fn set_path_view(&mut self, shown: bool) {
+        self.path_view = shown;
+        // The columns get shorter or taller: keep the selections in sight.
+        // (Before the first layout, `reveal_pending` sees to that.)
+        if self.columns_rect().h == 0 {
+            return;
+        }
+        let rows = self.rows_per_column();
+        for col in &mut self.columns {
+            if let Some(lead) = col.lead {
+                col.scroll_to(lead, rows);
+            }
+        }
+        self.sync();
+    }
+
+    pub fn toggle_path_view(&mut self) {
+        self.set_path_view(!self.path_view);
     }
 
     /// Re-reads every column from disk, keeping selections by name and closing
@@ -890,20 +918,28 @@ impl Browser {
         self.columns.len() + files as usize
     }
 
+    /// The path view's area: no height at all while it is turned off.
     fn path_rect(&self) -> Rect {
         let b = self.bounds;
-        Rect::new(b.x + MARGIN, b.y + MARGIN, (b.w - 2 * MARGIN).max(0), PATH_H)
+        let h = if self.path_view { PATH_H } else { 0 };
+        Rect::new(b.x + MARGIN, b.y + MARGIN, (b.w - 2 * MARGIN).max(0), h)
     }
 
+    /// The scroller's area, sharing its top edge with the path view's bottom
+    /// border. It goes with the path view: no height while that is off.
     fn hscroll_rect(&self) -> Rect {
-        // Shares its top edge with the path view's bottom border.
         let p = self.path_rect();
-        Rect::new(p.x, p.bottom() - 1, p.w, SCROLLBAR_THICKNESS)
+        let h = if self.path_view { SCROLLBAR_THICKNESS } else { 0 };
+        Rect::new(p.x, p.bottom() - 1, p.w, h)
     }
 
     fn columns_rect(&self) -> Rect {
         let b = self.bounds;
-        let top = self.hscroll_rect().bottom() + MARGIN;
+        let top = if self.path_view {
+            self.hscroll_rect().bottom() + MARGIN
+        } else {
+            b.y + MARGIN
+        };
         let bottom = b.bottom() - STATUS_H;
         Rect::new(b.x + MARGIN, top, (b.w - 2 * MARGIN).max(0), (bottom - top).max(0))
     }
@@ -1756,8 +1792,10 @@ impl Widget for Browser {
         self.sync();
         self.scale = p.scale();
         self.refresh_preview();
-        self.paint_path_view(p, theme);
-        self.hscroll.paint(p, theme);
+        if self.path_view {
+            self.paint_path_view(p, theme);
+            self.hscroll.paint(p, theme);
+        }
         for v in 0..self.visible {
             self.paint_column(p, theme, v);
         }
