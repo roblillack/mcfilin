@@ -7,7 +7,7 @@ description = "A file viewer with Miller columns, after NeXTSTEP's File Viewer"
 license = "MIT"
 
 [dependencies]
-saudade = { path = "../saudade" }
+saudade = "0.8"
 # Thumbnails: the cache names them by the MD5 of the file's URI, and they are PNGs.
 md-5 = "0.10"
 png = "0.17"
