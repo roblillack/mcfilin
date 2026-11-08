@@ -1,7 +1,7 @@
 //! Everything McFilin does to the filesystem: reading a directory into the
 //! entries a browser column shows, moving and copying files for a drop,
-//! creating folders, trashing and deleting, and handing a file to the desktop
-//! to open.
+//! creating folders, renaming, trashing and deleting, and handing a file to
+//! the desktop to open.
 
 use std::ffi::OsString;
 use std::fs;
@@ -186,6 +186,45 @@ fn copy_recursive(src: &Path, target: &Path) -> io::Result<()> {
     }
 }
 
+/// Renames `path` to `new_name` in the same folder and returns its new path.
+/// Refuses names that aren't one plain path component, and never replaces
+/// another file — though changing only the case of a name, on a filesystem
+/// that ignores case, is fine.
+pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
+    if new_name.is_empty() || new_name == "." || new_name == ".." {
+        return Err(io::Error::other("that name isn't allowed"));
+    }
+    if let Some(c) = new_name
+        .chars()
+        .find(|&c| std::path::is_separator(c) || c == '\0')
+    {
+        return Err(io::Error::other(format!("a name can't contain “{c}”")));
+    }
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let target = dir.join(new_name);
+    if let Ok(existing) = target.symlink_metadata()
+        && !same_file(&path.symlink_metadata()?, &existing)
+    {
+        return Err(io::Error::other(format!(
+            "“{new_name}” already exists in “{}”",
+            display_name(dir)
+        )));
+    }
+    fs::rename(path, &target)?;
+    Ok(target)
+}
+
+#[cfg(unix)]
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    (a.dev(), a.ino()) == (b.dev(), b.ino())
+}
+
+#[cfg(not(unix))]
+fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
+    false
+}
+
 /// Moves each of `paths` to the trash. Returns a message for each that
 /// couldn't be; one failure doesn't stop the others.
 pub fn trash(paths: &[PathBuf]) -> Vec<String> {
@@ -349,6 +388,23 @@ mod tests {
         assert_eq!(done, [b.join("file.txt")]);
         assert!(!file.exists());
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn renames_without_replacing() {
+        let dir = scratch("rename");
+        fs::write(dir.join("a"), "a").unwrap();
+        fs::write(dir.join("b"), "b").unwrap();
+        assert_eq!(rename(&dir.join("a"), "c").unwrap(), dir.join("c"));
+        assert!(!dir.join("a").exists());
+        assert!(rename(&dir.join("c"), "b").is_err());
+        assert_eq!(fs::read_to_string(dir.join("b")).unwrap(), "b");
+        for bad in ["", ".", "..", "x/y"] {
+            assert!(rename(&dir.join("c"), bad).is_err(), "{bad:?}");
+        }
+        // Renaming to its own name is no clash.
+        assert!(rename(&dir.join("c"), "c").is_ok());
         fs::remove_dir_all(dir).unwrap();
     }
 

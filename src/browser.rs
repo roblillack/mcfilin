@@ -22,7 +22,9 @@
 //!
 //! The file operations act on the selection of the column the keyboard is in:
 //! Delete moves it to the trash, Shift+Delete deletes it for good once
-//! confirmed.
+//! confirmed, and F2 edits the name of a single selected item in place —
+//! Enter, or a click elsewhere, renames it; Escape leaves it as it was. A new
+//! folder starts out with its name being edited.
 
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
@@ -33,7 +35,7 @@ use std::time::{Duration, Instant};
 use saudade::{
     Color, Dialog, DragData, Event, EventCtx, FontFamily, FontStyle, Key, Merged, Modifiers,
     MouseButton, NamedKey, Painter, Point, Rect, SCROLLBAR_THICKNESS, ScrollBar, Size, SvgImage,
-    Theme, Widget, include_svg,
+    TextInput, Theme, Widget, include_svg,
 };
 
 use crate::fsops::{self, Entry, Op};
@@ -241,6 +243,16 @@ enum Preview {
     Many(Vec<(&'static str, String)>),
 }
 
+/// A name being edited in place.
+struct Rename {
+    /// The folder the item is in, and its name there.
+    dir: PathBuf,
+    name: OsString,
+    /// The name as it was shown, to tell whether it was changed.
+    label: String,
+    input: TextInput,
+}
+
 /// What sits in one slot of the path view.
 struct SlotInfo {
     icon: SvgImage,
@@ -299,6 +311,7 @@ pub struct Browser {
     errors: Vec<(String, String)>,
     /// This browser, for dialogs that act on it once confirmed.
     this: Weak<RefCell<Browser>>,
+    rename: Option<Rename>,
 }
 
 impl Browser {
@@ -329,6 +342,7 @@ impl Browser {
             dialog,
             errors: Vec::new(),
             this,
+            rename: None,
         };
         me.go_to(start);
         me
@@ -493,20 +507,153 @@ impl Browser {
         }
     }
 
+    /// Makes a folder in the current folder and starts editing its name.
     pub fn new_folder(&mut self) {
         let dir = self.current_dir().to_path_buf();
         match fsops::new_folder(&dir) {
             Ok(path) => {
                 self.reload();
-                let slot = self.columns.iter().position(|c| c.dir == dir);
-                if let (Some(slot), Some(name)) = (slot, path.file_name())
-                    && let Some(row) = self.columns[slot].index_of(name)
-                {
-                    self.select_row(slot, row);
+                if self.select_path(&path) {
+                    self.start_rename();
                 }
             }
             Err(e) => self.show_errors("Couldn't create a folder", &[e.to_string()]),
         }
+    }
+
+    /// Selects `path` in the column listing its folder, if one does.
+    fn select_path(&mut self, path: &Path) -> bool {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return false;
+        };
+        let slot = self.columns.iter().position(|c| c.dir == dir);
+        if let Some(slot) = slot
+            && let Some(row) = self.columns[slot].index_of(name)
+        {
+            self.select_row(slot, row);
+            return true;
+        }
+        false
+    }
+
+    // ------------------------------------------------------------------
+    // Renaming in place.
+    // ------------------------------------------------------------------
+
+    /// Starts editing the name of the selected item of the active column, if
+    /// exactly one is selected.
+    pub fn start_rename(&mut self) {
+        self.finish_rename();
+        let slot = self.active_slot();
+        let col = &self.columns[slot];
+        let [row] = col.selected[..] else { return };
+        let entry = &col.entries[row];
+        let mut input = TextInput::new(Rect::new(0, 0, 0, 0)).with_text(&entry.label);
+        input.select_all();
+        input.set_focused(self.focused);
+        self.rename = Some(Rename {
+            dir: col.dir.clone(),
+            name: entry.name.clone(),
+            label: entry.label.clone(),
+            input,
+        });
+        // Bring the row on screen to edit it there.
+        let rows = self.rows_per_column();
+        self.columns[slot].scroll_to(row, rows);
+        if slot < self.first {
+            self.first = slot;
+        }
+        self.sync();
+    }
+
+    /// Where the name being edited is: its column's slot and row.
+    fn rename_target(&self) -> Option<(usize, usize)> {
+        let r = self.rename.as_ref()?;
+        let slot = self.columns.iter().position(|c| c.dir == r.dir)?;
+        Some((slot, self.columns[slot].index_of(&r.name)?))
+    }
+
+    /// The text field over the row being renamed, while that row is on screen.
+    fn rename_rect(&self) -> Option<Rect> {
+        let (slot, row) = self.rename_target()?;
+        let v = slot.checked_sub(self.first).filter(|&v| v < self.visible)?;
+        let top = self.columns[slot].bar.value().max(0) as usize;
+        let shown = row.checked_sub(top).filter(|&r| r < self.rows_per_column())?;
+        let field = Self::field_rect(self.cell(v, self.columns_rect()));
+        let y = field.y + ROW_PAD_Y + shown as i32 * ROW_H;
+        // The text lands where the label was: the field pads it by 4.
+        let x = field.x + 4 + SMALL_ICON + 4 - 4;
+        Some(Rect::new(x, y - 2, field.right() - 2 - x, ROW_H + 4))
+    }
+
+    /// Renames the item to what was typed, if it was changed, and stops
+    /// editing.
+    pub fn finish_rename(&mut self) {
+        let Some(r) = self.rename.take() else { return };
+        let new_name = r.input.text();
+        if new_name == r.label {
+            return;
+        }
+        match fsops::rename(&r.dir.join(&r.name), &new_name) {
+            Ok(path) => {
+                self.reload();
+                self.select_path(&path);
+            }
+            Err(e) => self.show_errors("Couldn't rename", &[format!("{}: {e}", r.label)]),
+        }
+    }
+
+    fn cancel_rename(&mut self) {
+        self.rename = None;
+    }
+
+    /// Hands an event to the name being edited. Returns whether it was
+    /// handled there; otherwise it goes on to the browser, and a click
+    /// elsewhere has first finished the renaming.
+    fn rename_event(&mut self, event: &Event, ctx: &mut EventCtx) -> bool {
+        if self.rename.is_none() {
+            return false;
+        }
+        if self.rename_target().is_none() {
+            // The item is gone from under the field.
+            self.cancel_rename();
+            return false;
+        }
+        // Off screen, scrolled out of view, the field takes no clicks.
+        let rect = self.rename_rect().unwrap_or(Rect::new(0, 0, 0, 0));
+        let r = self.rename.as_mut().expect("checked above");
+        r.input.rect = rect;
+        match event {
+            Event::KeyDown {
+                key: Key::Named(NamedKey::Enter),
+                ..
+            } => self.finish_rename(),
+            Event::KeyDown {
+                key: Key::Named(NamedKey::Escape),
+                ..
+            } => self.cancel_rename(),
+            Event::KeyDown { .. } | Event::KeyUp { .. } | Event::Char { .. } => {
+                r.input.event(event, ctx);
+            }
+            Event::PointerDown { pos, .. } => {
+                if !rect.contains(*pos) {
+                    self.finish_rename();
+                    return false;
+                }
+                r.input.event(event, ctx);
+            }
+            Event::PointerMove { .. } | Event::PointerUp { .. } if r.input.captures_pointer() => {
+                r.input.event(event, ctx);
+            }
+            Event::Tick => {
+                r.input.event(event, ctx);
+                return false;
+            }
+            _ => return false,
+        }
+        ctx.consume_event();
+        ctx.request_paint();
+        true
     }
 
     fn transfer(&mut self, paths: &[PathBuf], dest: &Path, op: Op) {
@@ -1186,6 +1333,7 @@ impl Browser {
 
         let highlight = self.highlight().cloned();
         let active = self.focused && slot == self.active;
+        let renaming = self.rename_target().filter(|&(s, _)| s == slot).map(|(_, row)| row);
         if let Some(col) = self.columns.get(slot) {
             let saved = p.push_clip_frame(field, 1, Merged::RIGHT);
             let top = col.bar.value().max(0) as usize;
@@ -1211,6 +1359,9 @@ impl Browser {
                     &icon,
                     Rect::new(icon_x, y + (ROW_H - SMALL_ICON) / 2, SMALL_ICON, SMALL_ICON),
                 );
+                if renaming == Some(i) {
+                    continue; // the text field goes there
+                }
                 let label_x = icon_x + SMALL_ICON + 4;
                 let arrow_w = if entry.is_dir { 14 } else { 4 };
                 let label = fit_text(p, &entry.label, theme.font_size, field.right() - label_x - arrow_w);
@@ -1483,6 +1634,12 @@ impl Widget for Browser {
         for v in 0..self.visible {
             self.paint_column(p, theme, v);
         }
+        if let Some(rect) = self.rename_rect()
+            && let Some(r) = &mut self.rename
+        {
+            r.input.rect = rect;
+            r.input.paint(p, theme);
+        }
         let status = self.status_rect();
         let text = fit_text(p, &self.status_text(), theme.font_size, status.w);
         p.text(
@@ -1506,11 +1663,14 @@ impl Widget for Browser {
     }
 
     fn wants_ticks(&self) -> bool {
-        self.thumbs.pending()
+        // While a name is edited, for the caret's blink.
+        self.thumbs.pending() || self.rename.is_some()
     }
 
     fn captures_pointer(&self) -> bool {
-        !matches!(self.gesture, Gesture::Idle)
+        // Editing a name keeps the keyboard from the menu's accelerators, so
+        // Delete, Ctrl+C, and the like edit the text.
+        !matches!(self.gesture, Gesture::Idle) || self.rename.is_some()
     }
 
     fn focusable(&self) -> bool {
@@ -1519,11 +1679,17 @@ impl Widget for Browser {
 
     fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
+        if let Some(r) = &mut self.rename {
+            r.input.set_focused(focused);
+        }
     }
 }
 
 impl Browser {
     fn handle(&mut self, event: &Event, ctx: &mut EventCtx) {
+        if self.rename_event(event, ctx) {
+            return;
+        }
         match event {
             Event::PointerDown {
                 pos,

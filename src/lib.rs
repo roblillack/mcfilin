@@ -31,10 +31,13 @@ pub fn window(start: PathBuf) -> (WindowConfig, impl Widget) {
     });
 
     // Each menu item borrows the shared browser, does its thing, and repaints.
+    // A name being edited is settled first, as a click elsewhere would.
     let act = |f: fn(&mut Browser)| {
         let browser = browser.clone();
         move |cx: &mut EventCtx| {
-            f(&mut browser.borrow_mut());
+            let mut browser = browser.borrow_mut();
+            browser.finish_rename();
+            f(&mut browser);
             cx.request_paint();
         }
     };
@@ -47,6 +50,8 @@ pub fn window(start: PathBuf) -> (WindowConfig, impl Widget) {
                     .with_accel(Accel::primary('o')),
                 MenuItem::action("&New Folder", act(Browser::new_folder))
                     .with_accel(Accel::primary('n').shift()),
+                MenuItem::action("Re&name", act(Browser::start_rename))
+                    .with_accel(Accel::new(NamedKey::F2)),
                 MenuItem::separator(),
                 MenuItem::action("Move to &Trash", act(Browser::move_to_trash))
                     .with_accel(Accel::new(NamedKey::Delete)),
