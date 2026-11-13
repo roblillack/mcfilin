@@ -22,3 +22,8 @@ arboard = { version = "3", default-features = false }
 [target.'cfg(unix)'.dependencies]
 # Local time, and user / group names, for the info column.
 libc = "0.2"
+
+# EventCtx::modifiers and the re-hover on modifier changes, until they are
+# released.
+[patch.crates-io]
+saudade = { path = "../saudade" }

@@ -54,21 +54,26 @@ pub fn read_entries(dir: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
 pub enum Op {
     Move,
     Copy,
+    /// Makes a symbolic link to each file, by the file's name.
+    Link,
 }
 
 /// Whether dropping `sources` onto the folder `dest` with `op` makes sense at
-/// all: never into a dragged folder itself or below it, and never a move into
-/// the folder the file already lives in (copying there duplicates it). Purely
-/// lexical, for highlighting drop targets while a drag hovers; [`transfer`]
-/// checks again against the real, symlink-resolved paths.
+/// all. A move or a copy never goes into a dragged folder itself or below it;
+/// a link may go below it, but not into it. Neither a move nor a link goes
+/// into the folder the file already lives in, where copying duplicates it.
+/// Purely lexical, for highlighting drop targets while a drag hovers;
+/// [`transfer`] checks again against the real, symlink-resolved paths.
 pub fn can_drop(sources: &[PathBuf], dest: &Path, op: Op) -> bool {
     !sources.is_empty()
-        && sources.iter().all(|src| {
-            !dest.starts_with(src) && (op == Op::Copy || src.parent() != Some(dest))
+        && sources.iter().all(|src| match op {
+            Op::Move => !dest.starts_with(src) && src.parent() != Some(dest),
+            Op::Copy => !dest.starts_with(src),
+            Op::Link => dest != src && src.parent() != Some(dest),
         })
 }
 
-/// Moves or copies each of `sources` into the folder `dest`. Returns the new
+/// Moves, copies or links each of `sources` into the folder `dest`. Returns the new
 /// paths of the items that made it and a message for each that didn't; one
 /// failure doesn't stop the others.
 pub fn transfer(sources: &[PathBuf], dest: &Path, op: Op) -> (Vec<PathBuf>, Vec<String>) {
@@ -102,11 +107,14 @@ fn transfer_one(src: &Path, dest: &Path, op: Op) -> io::Result<Option<PathBuf>> 
         .map(|p| p.join(name))
         .unwrap_or_else(|| src.to_path_buf());
     let real_dest = dest.canonicalize()?;
-    if real_dest.starts_with(&real_src) {
+    // A link inside the folder it points to is no trouble: nothing is walked.
+    if real_dest.starts_with(&real_src) && (op != Op::Link || real_dest == real_src) {
         return Err(io::Error::other("can't put a folder inside itself"));
     }
 
-    let target = if same_dir {
+    // Next to itself, a copy gets a name of its own; a link finds the name
+    // taken.
+    let target = if same_dir && op == Op::Copy {
         unique_copy_name(dest, name)
     } else {
         dest.join(name)
@@ -121,6 +129,7 @@ fn transfer_one(src: &Path, dest: &Path, op: Op) -> io::Result<Option<PathBuf>> 
 
     match op {
         Op::Copy => copy_recursive(src, &target)?,
+        Op::Link => symlink(&std::path::absolute(src)?, &target)?,
         Op::Move => match fs::rename(src, &target) {
             Ok(()) => {}
             // Another filesystem: rename can't, so copy and then delete — and
@@ -133,6 +142,20 @@ fn transfer_one(src: &Path, dest: &Path, op: Op) -> io::Result<Option<PathBuf>> 
         },
     }
     Ok(Some(target))
+}
+
+/// Makes `link` a symbolic link to `original`. Windows tells links to folders
+/// from links to files, and makes them only with Developer Mode on or for an
+/// administrator.
+fn symlink(original: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(original, link);
+    #[cfg(windows)]
+    return if original.is_dir() {
+        std::os::windows::fs::symlink_dir(original, link)
+    } else {
+        std::os::windows::fs::symlink_file(original, link)
+    };
 }
 
 /// "notes.txt" copied next to itself becomes "notes copy.txt", then
@@ -392,6 +415,38 @@ mod tests {
     }
 
     #[test]
+    fn links_by_name_and_refuses_overwrites() {
+        let dir = scratch("link");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        fs::create_dir_all(a.join("sub")).unwrap();
+        fs::write(a.join("file.txt"), "hi").unwrap();
+        fs::create_dir(&b).unwrap();
+
+        // A file, and a folder, linked into another folder.
+        let sources = [a.join("file.txt"), a.join("sub")];
+        let (done, errors) = transfer(&sources, &b, Op::Link);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(done, [b.join("file.txt"), b.join("sub")]);
+        assert_eq!(fs::read_link(b.join("file.txt")).unwrap(), a.join("file.txt"));
+        assert_eq!(fs::read_to_string(b.join("file.txt")).unwrap(), "hi");
+        assert!(b.join("sub").is_dir());
+
+        // Again: the names are taken.
+        let (_, errors) = transfer(&sources, &b, Op::Link);
+        assert_eq!(errors.len(), 2);
+
+        // A folder linked below itself, but not into itself.
+        let (done, errors) = transfer(std::slice::from_ref(&a), &a.join("sub"), Op::Link);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(done, [a.join("sub/a")]);
+        let (_, errors) = transfer(std::slice::from_ref(&b), &b, Op::Link);
+        assert_eq!(errors.len(), 1);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn renames_without_replacing() {
         let dir = scratch("rename");
         fs::write(dir.join("a"), "a").unwrap();
@@ -430,6 +485,10 @@ mod tests {
         assert!(!can_drop(&src, Path::new("/a/b"), Op::Copy)); // into itself
         assert!(!can_drop(&src, Path::new("/a/b/c"), Op::Move)); // below itself
         assert!(can_drop(&src, Path::new("/a/bc"), Op::Move));
+        assert!(!can_drop(&src, Path::new("/a"), Op::Link)); // name taken
+        assert!(!can_drop(&src, Path::new("/a/b"), Op::Link)); // into itself
+        assert!(can_drop(&src, Path::new("/a/b/c"), Op::Link)); // below is fine
+        assert!(can_drop(&src, Path::new("/a/c"), Op::Link));
     }
 
     #[test]

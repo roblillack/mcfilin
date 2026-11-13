@@ -1606,8 +1606,6 @@ dependencies = [
 [[package]]
 name = "saudade"
 version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4a97456c9f1eedc97fc6fda6181ddf73762dcdbce3f4a1f15b1052bc8119596"
 dependencies = [
  "arboard",
  "block2 0.6.2",
@@ -1635,8 +1633,6 @@ dependencies = [
 [[package]]
 name = "saudade-macros"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c05ddfc4344babcf78529650b51469eea053cd02ca948a876e6b5bad4898f296"
 dependencies = [
  "i_overlay",
  "kurbo",

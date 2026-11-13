@@ -20,10 +20,12 @@
 //! Selecting a folder in a column opens the next column for it; the view keeps
 //! the end of the path in sight. Items are dragged with the mouse onto a folder
 //! row, a column (its folder), or a folder icon in the path view: a plain drop
-//! moves, holding Ctrl or Alt on release copies; Escape calls a drag off, and
-//! the release then does nothing. On Wayland, dragging past the
-//! window's edge hands the drag to the desktop, so files can be dropped onto
-//! other applications; drops from other applications are copied in.
+//! moves, holding Ctrl or Alt copies, and Ctrl+Shift makes symbolic links to
+//! them. The pointer shows which, or a no-drop sign where a drop can't land.
+//! Escape calls a drag off, and the release then does nothing. On Wayland,
+//! dragging past the window's edge hands the drag to the desktop, so files can
+//! be dropped onto other applications; drops from other applications are
+//! copied in.
 //!
 //! A click on the shelf goes to that folder, as does its item in the Go menu,
 //! where the first ten places have Ctrl+1 … Ctrl+0. Folders dropped on the
@@ -52,7 +54,7 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use saudade::{
-    Accel, Color, Dialog, DragData, Event, EventCtx, FontFamily, FontStyle, Key, Merged,
+    Accel, Color, Cursor, Dialog, DragData, Event, EventCtx, FontFamily, FontStyle, Key, Merged,
     ModifierScheme, Modifiers, MouseButton, NamedKey, Painter, Point, Rect, SCROLLBAR_THICKNESS,
     ScrollBar, Size, SvgImage, TextInput, Theme, Widget, include_svg,
 };
@@ -262,7 +264,9 @@ enum Gesture {
     Drag {
         paths: Vec<PathBuf>,
         pos: Point,
-        /// The drop target under the pointer, assuming a move.
+        /// What a drop would do, by the modifiers held.
+        op: Op,
+        /// The drop target under the pointer, for `op`.
         target: Option<Target>,
     },
     /// Pressed on the shelf's icon in `place`, not yet moved far enough to
@@ -928,6 +932,7 @@ impl Browser {
         let title = match op {
             Op::Move => "Couldn't move",
             Op::Copy => "Couldn't copy",
+            Op::Link => "Couldn't link",
         };
         self.show_errors(title, &errors);
         done
@@ -1500,8 +1505,9 @@ impl Browser {
                 let (dx, dy) = (pos.x - origin.x, pos.y - origin.y);
                 if dx * dx + dy * dy >= DRAG_THRESHOLD * DRAG_THRESHOLD && !paths.is_empty() {
                     let paths = std::mem::take(paths);
-                    let target = self.target_at(pos, &paths, Op::Move);
-                    self.gesture = Gesture::Drag { paths, pos, target };
+                    let op = drop_op(ctx.modifiers());
+                    let target = self.target_at(pos, &paths, op);
+                    self.gesture = Gesture::Drag { paths, pos, op, target };
                 }
             }
             Gesture::ShelfPress { origin, place } => {
@@ -1536,18 +1542,43 @@ impl Browser {
                         self.os_drag = Some(paths);
                     }
                 } else {
-                    let new_target = match &self.gesture {
-                        Gesture::Drag { paths, .. } => self.target_at(pos, paths, Op::Move),
-                        _ => None,
-                    };
-                    if let Gesture::Drag { pos: p, target, .. } = &mut self.gesture {
-                        *p = pos;
-                        *target = new_target;
-                    }
+                    self.aim_drag(pos, drop_op(ctx.modifiers()));
                 }
             }
         }
+        if let Some(cursor) = self.drag_cursor() {
+            ctx.set_cursor(cursor);
+        }
         ctx.request_paint();
+    }
+
+    /// Points the drag at `pos`, for a drop doing `op`.
+    fn aim_drag(&mut self, pos: Point, op: Op) {
+        let new_target = match &self.gesture {
+            Gesture::Drag { paths, .. } => self.target_at(pos, paths, op),
+            _ => return,
+        };
+        if let Gesture::Drag { pos: p, op: o, target, .. } = &mut self.gesture {
+            *p = pos;
+            *o = op;
+            *target = new_target;
+        }
+    }
+
+    /// The pointer for the drag going on: what a drop would do there, or that
+    /// it can't land there at all.
+    fn drag_cursor(&self) -> Option<Cursor> {
+        match &self.gesture {
+            Gesture::Drag { target: None, .. } => Some(Cursor::NoDrop),
+            Gesture::Drag { target: Some(target), op, .. } => Some(match (&target.dest, op) {
+                // The shelf keeps a reference to the folder, as a link does.
+                (Dest::Shelf(_), _) | (Dest::Folder(_), Op::Link) => Cursor::Alias,
+                (Dest::Folder(_), Op::Copy) => Cursor::Copy,
+                (Dest::Folder(_), Op::Move) => Cursor::Grabbing,
+            }),
+            Gesture::ShelfDrag { .. } => Some(Cursor::Grabbing),
+            _ => None,
+        }
     }
 
     fn pointer_up(&mut self, event: &Event, pos: Point, mods: Modifiers, ctx: &mut EventCtx) {
@@ -1573,11 +1604,7 @@ impl Browser {
                 Click::PathIcon(slot) => self.go_to_slot(slot),
             },
             Gesture::Drag { paths, .. } => {
-                let op = if mods.control || mods.alt || mods.logo {
-                    Op::Copy
-                } else {
-                    Op::Move
-                };
+                let op = drop_op(mods);
                 if let Some(target) = self.target_at(pos, &paths, op) {
                     self.drop_on(target, &paths, op);
                 }
@@ -1653,13 +1680,7 @@ impl Browser {
         }
         // While dragging, what's under the pointer has just changed.
         if let Gesture::Drag { pos, .. } = self.gesture {
-            let new_target = match &self.gesture {
-                Gesture::Drag { paths, .. } => self.target_at(pos, paths, Op::Move),
-                _ => None,
-            };
-            if let Gesture::Drag { target, .. } = &mut self.gesture {
-                *target = new_target;
-            }
+            self.aim_drag(pos, drop_op(ctx.modifiers()));
         }
         ctx.request_paint();
     }
@@ -2062,13 +2083,19 @@ impl Browser {
     }
 
     fn status_text(&self) -> String {
-        if let Gesture::Drag { paths, target, .. } = &self.gesture {
+        if let Gesture::Drag { paths, op, target, .. } = &self.gesture {
             let what = describe(paths);
             return match target.as_ref().map(|t| &t.dest) {
-                Some(Dest::Folder(dir)) => format!(
-                    "Move {what} to “{}” — hold Ctrl when dropping to copy",
-                    fsops::display_name(dir)
-                ),
+                Some(Dest::Folder(dir)) => {
+                    let dir = fsops::display_name(dir);
+                    match op {
+                        Op::Move => {
+                            format!("Move {what} to “{dir}” — hold Ctrl to copy, Ctrl+Shift to link")
+                        }
+                        Op::Copy => format!("Copy {what} to “{dir}”"),
+                        Op::Link => format!("Link to {what} from “{dir}”"),
+                    }
+                }
                 Some(Dest::Shelf(_)) => format!("Put {what} on the shelf"),
                 None => format!("Drag {what} onto a folder"),
             };
@@ -2311,6 +2338,18 @@ fn flatten(pixels: &[u32], bg: Color) -> Vec<u32> {
             0xff00_0000 | ch(16) | ch(8) | ch(0)
         })
         .collect()
+}
+
+/// What a drop does with the modifiers `mods` held: Ctrl or Alt (or the logo
+/// key, Command on a Mac) copies, Ctrl+Shift links, and nothing moves.
+fn drop_op(mods: Modifiers) -> Op {
+    if mods.control && mods.shift {
+        Op::Link
+    } else if mods.control || mods.alt || mods.logo {
+        Op::Copy
+    } else {
+        Op::Move
+    }
 }
 
 /// "notes.txt", or "3 items".
