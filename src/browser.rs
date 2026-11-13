@@ -22,16 +22,20 @@
 //! row, a column (its folder), or a folder icon in the path view: a plain drop
 //! moves, holding Ctrl or Alt copies, and Ctrl+Shift makes symbolic links to
 //! them. The pointer shows which, or a no-drop sign where a drop can't land.
-//! Escape calls a drag off, and the release then does nothing. On Wayland,
-//! dragging past the window's edge hands the drag to the desktop, so files can
-//! be dropped onto other applications; drops from other applications are
-//! copied in.
+//! Escape calls a drag off, and the release then does nothing. On Wayland a
+//! drag is the desktop's from the start, as in other programs, so it can be
+//! dropped onto other applications as well, which may move the files too. The
+//! desktop then draws the pointer, showing a link — or a drop on the shelf —
+//! as a question, and calls the drag off at Escape. Drops from other
+//! applications are copied in.
 //!
 //! A click on the shelf goes to that folder, as does its item in the Go menu,
 //! where the first ten places have Ctrl+1 … Ctrl+0. Folders dropped on the
 //! shelf between its icons are put there; dropped on an icon, files go into that
 //! folder as anywhere else. The icons after the home folder's are dragged to
-//! put them in another order, or off the shelf to take them off it.
+//! put them in another order, or off the shelf to take them off it. On
+//! Wayland they can be dragged onto other applications as well, which only
+//! ever get to copy the folder.
 //!
 //! The keyboard works in one column at a time: the arrow keys, Page Up/Down,
 //! Home and End move the selection, and with Shift held extend it from where
@@ -54,9 +58,9 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use saudade::{
-    Accel, Color, Cursor, Dialog, DragData, Event, EventCtx, FontFamily, FontStyle, Key, Merged,
-    ModifierScheme, Modifiers, MouseButton, NamedKey, Painter, Point, Rect, SCROLLBAR_THICKNESS,
-    ScrollBar, Size, SvgImage, TextInput, Theme, Widget, include_svg,
+    Accel, Color, Cursor, Dialog, DragData, DropAction, Event, EventCtx, FontFamily, FontStyle,
+    Key, Merged, ModifierScheme, Modifiers, MouseButton, NamedKey, Painter, Point, Rect,
+    SCROLLBAR_THICKNESS, ScrollBar, Size, SvgImage, TextInput, Theme, Widget, include_svg,
 };
 
 use crate::clipboard::Clipboard;
@@ -246,6 +250,44 @@ struct Target {
     highlight: Highlight,
 }
 
+/// A drag handed to the desktop, followed for as long as it lasts.
+enum OsDrag {
+    /// Files, moved, copied or linked when dropped back in the window, as by
+    /// a drag inside it.
+    Files(Vec<PathBuf>),
+    /// The `i`-th bookmark: dropped back in the window, it goes to a gap on
+    /// the shelf, or off the shelf.
+    Bookmark(usize),
+}
+
+/// What a drag over the window would do, dropped where it is now.
+enum Hover {
+    /// Nothing: it can't land here.
+    Nowhere,
+    /// `op` on `target`.
+    Drop { target: Target, op: Op },
+    /// Move the bookmark dragged to the shelf's `gap`, or with none, off the
+    /// shelf.
+    Bookmark { gap: Option<usize> },
+}
+
+impl Hover {
+    /// What the drop does, as the desktop shows it in the pointer. It knows
+    /// no links, nor the shelf, which keeps a reference as a link does: for
+    /// those it shows a question.
+    fn action(&self) -> Option<DropAction> {
+        match self {
+            Hover::Nowhere => None,
+            Hover::Bookmark { .. } | Hover::Drop { op: Op::Link, .. } => Some(DropAction::Ask),
+            Hover::Drop { target, .. } if matches!(target.dest, Dest::Shelf(_)) => {
+                Some(DropAction::Ask)
+            }
+            Hover::Drop { op: Op::Move, .. } => Some(DropAction::Move),
+            Hover::Drop { op: Op::Copy, .. } => Some(DropAction::Copy),
+        }
+    }
+}
+
 /// What a press on the left button started, followed until its release.
 enum Gesture {
     Idle,
@@ -348,11 +390,11 @@ pub struct Browser {
     last_click: Option<(usize, usize, Instant)>,
     typed: String,
     typed_at: Instant,
-    /// The files of a drag handed to the desktop, so dropping it back into the
-    /// window moves them like a drag that never left.
-    os_drag: Option<Vec<PathBuf>>,
-    /// The drop target under a drag coming from outside the window.
-    os_hover: Option<Highlight>,
+    /// The drag handed to the desktop, so dropping it back into the window
+    /// does what a drag inside it would.
+    os_drag: Option<OsDrag>,
+    /// What a drag over the window would do; `None` while none is over it.
+    os_hover: Option<Hover>,
     /// Lead rows still to be scrolled into view once the columns have a size.
     reveal_pending: bool,
     /// The selection the info column describes, and what it says about it.
@@ -1374,6 +1416,24 @@ impl Browser {
         folder(col.dir.clone(), Highlight::Column(slot))
     }
 
+    /// What a drag over the window would do, dropped at `pos` with `mods`
+    /// held: one of our own handed to the desktop as it would inside the
+    /// window, another application's as a copy.
+    fn hover_at(&self, pos: Point, mods: Modifiers) -> Hover {
+        let target = match &self.os_drag {
+            Some(OsDrag::Bookmark(_)) => return Hover::Bookmark { gap: self.shelf_gap_at(pos) },
+            Some(OsDrag::Files(paths)) => {
+                let op = drop_op(mods);
+                self.target_at(pos, paths, op).map(|target| (target, op))
+            }
+            None => self.raw_target_at(pos).map(|target| (target, Op::Copy)),
+        };
+        match target {
+            Some((target, op)) => Hover::Drop { target, op },
+            None => Hover::Nowhere,
+        }
+    }
+
     fn target_at(&self, pos: Point, paths: &[PathBuf], op: Op) -> Option<Target> {
         self.raw_target_at(pos).filter(|t| match &t.dest {
             Dest::Folder(dir) => fsops::can_drop(paths, dir, op),
@@ -1391,10 +1451,12 @@ impl Browser {
         }
     }
 
-    fn highlight(&self) -> Option<&Highlight> {
-        match &self.gesture {
-            Gesture::Drag { target, .. } => target.as_ref().map(|t| &t.highlight),
-            _ => self.os_hover.as_ref(),
+    fn highlight(&self) -> Option<Highlight> {
+        match (&self.gesture, &self.os_hover) {
+            (Gesture::Drag { target, .. }, _) => target.as_ref().map(|t| t.highlight.clone()),
+            (_, Some(Hover::Drop { target, .. })) => Some(target.highlight.clone()),
+            (_, Some(Hover::Bookmark { gap: Some(gap) })) => Some(Highlight::ShelfGap(*gap)),
+            _ => None,
         }
     }
 
@@ -1505,23 +1567,42 @@ impl Browser {
                 let (dx, dy) = (pos.x - origin.x, pos.y - origin.y);
                 if dx * dx + dy * dy >= DRAG_THRESHOLD * DRAG_THRESHOLD && !paths.is_empty() {
                     let paths = std::mem::take(paths);
-                    let op = drop_op(ctx.modifiers());
-                    let target = self.target_at(pos, &paths, op);
-                    self.gesture = Gesture::Drag { paths, pos, op, target };
+                    if wayland_session() {
+                        // The desktop's drag from the start, as in other
+                        // programs: over this window it comes back as drag
+                        // events.
+                        let actions = [DropAction::Move, DropAction::Ask];
+                        ctx.start_drag_offering(DragData::from_paths(paths.clone()), &actions);
+                        self.os_drag = Some(OsDrag::Files(paths));
+                        self.gesture = Gesture::Idle;
+                    } else {
+                        let op = drop_op(ctx.modifiers());
+                        let target = self.target_at(pos, &paths, op);
+                        self.gesture = Gesture::Drag { paths, pos, op, target };
+                    }
                 }
             }
             Gesture::ShelfPress { origin, place } => {
                 let (dx, dy) = (pos.x - origin.x, pos.y - origin.y);
                 if dx * dx + dy * dy >= DRAG_THRESHOLD * DRAG_THRESHOLD {
-                    self.gesture = match *place {
+                    let place = *place;
+                    self.gesture = Gesture::Idle;
+                    if place == 0 {
                         // The home folder stays where it is; nor is it a click.
-                        0 => Gesture::Idle,
-                        place => Gesture::ShelfDrag {
+                    } else if wayland_session()
+                        && let Some(path) = self.shelf_path(place)
+                    {
+                        // Copied, never moved: a bookmark dragged onto another
+                        // file manager mustn't take its folder along.
+                        ctx.start_drag_offering(DragData::from_paths([path]), &[DropAction::Ask]);
+                        self.os_drag = Some(OsDrag::Bookmark(place - 1));
+                    } else {
+                        self.gesture = Gesture::ShelfDrag {
                             index: place - 1,
                             pos,
                             gap: self.shelf_gap_at(pos),
-                        },
-                    };
+                        };
+                    }
                 }
             }
             Gesture::ShelfDrag { .. } => {
@@ -1531,20 +1612,7 @@ impl Browser {
                     *gap = new_gap;
                 }
             }
-            Gesture::Drag { .. } => {
-                if !self.window_rect().contains(pos) && wayland_session() {
-                    // Off the window: hand the drag to the desktop so it can
-                    // land in another application.
-                    if let Gesture::Drag { paths, .. } =
-                        std::mem::replace(&mut self.gesture, Gesture::Idle)
-                    {
-                        ctx.start_drag(DragData::from_paths(paths.clone()));
-                        self.os_drag = Some(paths);
-                    }
-                } else {
-                    self.aim_drag(pos, drop_op(ctx.modifiers()));
-                }
-            }
+            Gesture::Drag { .. } => self.aim_drag(pos, drop_op(ctx.modifiers())),
         }
         if let Some(cursor) = self.drag_cursor() {
             ctx.set_cursor(cursor);
@@ -1638,12 +1706,6 @@ impl Browser {
             self.first = value;
             self.sync();
         }
-    }
-
-    /// The whole window, as far as this widget can tell: it fills the window
-    /// below the menu bar.
-    fn window_rect(&self) -> Rect {
-        Rect::new(0, 0, self.bounds.right(), self.bounds.bottom())
     }
 
     fn scroll(&mut self, pos: Point, delta_x: f32, delta_y: f32, ctx: &mut EventCtx) {
@@ -1785,7 +1847,7 @@ impl Browser {
         let area = self.shelf_rect();
         p.sunken_bevel(area, theme.highlight, theme.shadow);
         let saved = p.push_clip_frame(area, 1, Merged::NONE);
-        let highlight = self.highlight().cloned();
+        let highlight = self.highlight();
         for place in 0..=self.shelf.len() {
             let cell = self.shelf_cell(place);
             let icon = Self::shelf_icon_rect(cell);
@@ -1825,7 +1887,7 @@ impl Browser {
         p.stroke_rect(area, theme.border);
         let saved = p.push_clip_frame(area, 1, Merged::NONE);
         let slots = self.slots();
-        let highlight = self.highlight().cloned();
+        let highlight = self.highlight();
         for v in 0..self.visible {
             let slot = self.first + v;
             let Some(info) = self.slot_info(slot) else { break };
@@ -1863,7 +1925,7 @@ impl Browser {
         p.sunken_bevel_merged(field, Merged::RIGHT, theme.highlight, theme.shadow);
         p.stroke_rect_merged(field, Merged::RIGHT, theme.border);
 
-        let highlight = self.highlight().cloned();
+        let highlight = self.highlight();
         let active = self.focused && slot == self.active;
         let renaming = self.rename_target().filter(|&(s, _)| s == slot).map(|(_, row)| row);
         if let Some(col) = self.columns.get(slot) {
@@ -2084,28 +2146,21 @@ impl Browser {
 
     fn status_text(&self) -> String {
         if let Gesture::Drag { paths, op, target, .. } = &self.gesture {
-            let what = describe(paths);
-            return match target.as_ref().map(|t| &t.dest) {
-                Some(Dest::Folder(dir)) => {
-                    let dir = fsops::display_name(dir);
-                    match op {
-                        Op::Move => {
-                            format!("Move {what} to “{dir}” — hold Ctrl to copy, Ctrl+Shift to link")
-                        }
-                        Op::Copy => format!("Copy {what} to “{dir}”"),
-                        Op::Link => format!("Link to {what} from “{dir}”"),
-                    }
-                }
-                Some(Dest::Shelf(_)) => format!("Put {what} on the shelf"),
-                None => format!("Drag {what} onto a folder"),
-            };
+            return drag_status(paths, *op, target.as_ref());
         }
         if let Gesture::ShelfDrag { index, gap, .. } = &self.gesture {
-            let name = self.shelf_label(index + 1);
-            return match gap {
-                Some(_) => format!("Move “{name}” along the shelf — drag it off to take it off"),
-                None => format!("Take “{name}” off the shelf"),
-            };
+            return self.shelf_drag_status(*index, *gap);
+        }
+        // A drag of our own handed to the desktop, while it's over the window.
+        match (&self.os_drag, &self.os_hover) {
+            (Some(OsDrag::Files(paths)), Some(Hover::Drop { target, op })) => {
+                return drag_status(paths, *op, Some(target));
+            }
+            (Some(OsDrag::Files(paths)), Some(_)) => return drag_status(paths, Op::Move, None),
+            (Some(OsDrag::Bookmark(index)), Some(Hover::Bookmark { gap })) => {
+                return self.shelf_drag_status(*index, *gap);
+            }
+            _ => {}
         }
         let last = self.columns.last().expect("the root column");
         match &last.selected[..] {
@@ -2126,6 +2181,16 @@ impl Browser {
                 }
             }
             many => format!("{} items selected in {}", many.len(), last.dir.display()),
+        }
+    }
+
+    /// The status line while the `index`-th bookmark is dragged, to the
+    /// shelf's `gap` or off the shelf.
+    fn shelf_drag_status(&self, index: usize, gap: Option<usize>) -> String {
+        let name = self.shelf_label(index + 1);
+        match gap {
+            Some(_) => format!("Move “{name}” along the shelf — drag it off to take it off"),
+            None => format!("Take “{name}” off the shelf"),
         }
     }
 
@@ -2285,16 +2350,14 @@ impl Browser {
                 self.type_ahead(*ch, ctx)
             }
             Event::DragEnter { pos } | Event::DragMove { pos } => {
-                // Where a drag from another application (or our own, handed
-                // to the desktop and come back) would land.
-                let target = match &self.os_drag {
-                    Some(paths) => self.target_at(*pos, paths, Op::Move),
-                    None => self.raw_target_at(*pos),
-                };
-                if target.is_some() {
-                    ctx.accept_drop();
+                if !ctx.is_dragging_out() {
+                    self.os_drag = None; // over, and this one is another's
                 }
-                self.os_hover = target.map(|t| t.highlight);
+                let hover = self.hover_at(*pos, ctx.modifiers());
+                if let Some(action) = hover.action() {
+                    ctx.accept_drop_as(action);
+                }
+                self.os_hover = Some(hover);
                 ctx.request_paint();
             }
             Event::DragLeave => {
@@ -2302,20 +2365,27 @@ impl Browser {
                 ctx.request_paint();
             }
             Event::Drop { pos, data } => {
-                self.os_hover = None;
-                if !data.paths.is_empty() {
-                    // Our own drag coming back moves, like one that never
-                    // left; anything else is copied in.
-                    let op = if self.os_drag.as_ref() == Some(&data.paths) {
-                        Op::Move
-                    } else {
-                        Op::Copy
-                    };
-                    if let Some(target) = self.target_at(*pos, &data.paths, op) {
-                        self.drop_on(target, &data.paths, op);
+                let hover = self.os_hover.take();
+                match (self.os_drag.take(), hover) {
+                    // Our own drag, come back: what it showed it would do.
+                    (Some(OsDrag::Files(paths)), Some(Hover::Drop { target, op })) => {
+                        self.drop_on(target, &paths, op);
                     }
+                    (Some(OsDrag::Bookmark(index)), Some(Hover::Bookmark { gap })) => {
+                        let changed = match gap {
+                            Some(gap) => self.shelf.move_to(index, gap),
+                            None => self.shelf.remove(index),
+                        };
+                        self.shelf_changed(changed);
+                    }
+                    // Another application's is copied in.
+                    (None, _) if !data.paths.is_empty() => {
+                        if let Some(target) = self.target_at(*pos, &data.paths, Op::Copy) {
+                            self.drop_on(target, &data.paths, Op::Copy);
+                        }
+                    }
+                    _ => {}
                 }
-                self.os_drag = None;
                 ctx.request_paint();
             }
             _ => {}
@@ -2353,6 +2423,23 @@ fn drop_op(mods: Modifiers) -> Op {
 }
 
 /// "notes.txt", or "3 items".
+/// The status line while `paths` are dragged, to do `op` on `target`.
+fn drag_status(paths: &[PathBuf], op: Op, target: Option<&Target>) -> String {
+    let what = describe(paths);
+    match target.map(|t| &t.dest) {
+        Some(Dest::Folder(dir)) => {
+            let dir = fsops::display_name(dir);
+            match op {
+                Op::Move => format!("Move {what} to “{dir}” — hold Ctrl to copy, Ctrl+Shift to link"),
+                Op::Copy => format!("Copy {what} to “{dir}”"),
+                Op::Link => format!("Link to {what} from “{dir}”"),
+            }
+        }
+        Some(Dest::Shelf(_)) => format!("Put {what} on the shelf"),
+        None => format!("Drag {what} onto a folder"),
+    }
+}
+
 fn describe(paths: &[PathBuf]) -> String {
     match paths {
         [one] => format!("“{}”", fsops::display_name(one)),
