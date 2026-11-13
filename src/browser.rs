@@ -20,7 +20,8 @@
 //! Selecting a folder in a column opens the next column for it; the view keeps
 //! the end of the path in sight. Items are dragged with the mouse onto a folder
 //! row, a column (its folder), or a folder icon in the path view: a plain drop
-//! moves, holding Ctrl or Alt on release copies. On Wayland, dragging past the
+//! moves, holding Ctrl or Alt on release copies; Escape calls a drag off, and
+//! the release then does nothing. On Wayland, dragging past the
 //! window's edge hands the drag to the desktop, so files can be dropped onto
 //! other applications; drops from other applications are copied in.
 //!
@@ -1668,6 +1669,21 @@ impl Browser {
     // ------------------------------------------------------------------
 
     fn key_down(&mut self, key: &Key, mods: Modifiers, ctx: &mut EventCtx) {
+        // Escape calls off a drag, or a press that would become one. The button
+        // is still held: its release finds the gesture idle and does nothing.
+        if matches!(key, Key::Named(NamedKey::Escape))
+            && matches!(
+                self.gesture,
+                Gesture::Press { .. }
+                    | Gesture::Drag { .. }
+                    | Gesture::ShelfPress { .. }
+                    | Gesture::ShelfDrag { .. }
+            )
+        {
+            self.gesture = Gesture::Idle;
+            ctx.request_paint();
+            return;
+        }
         if mods.control || mods.alt || mods.logo {
             let home = Accel::primary('h').shift();
             match key {
