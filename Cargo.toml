@@ -4,9 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A file viewer with Miller columns, after NeXTSTEP's File Viewer"
+authors = ["Robert Lillack <rob@lillack.net>"]
 license = "MIT"
 repository = "https://github.com/roblillack/mcfilin"
+homepage = "https://github.com/roblillack/mcfilin"
 readme = "README.md"
+keywords = ["file-manager", "file-browser", "miller-columns", "nextstep", "retro"]
+categories = ["gui", "filesystem"]
 # The README's screenshot and the CI config stay out of the package.
 exclude = ["docs/", ".github/"]
 

@@ -36,9 +36,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Linux is pinned to Ubuntu 24.04 rather than ubuntu-latest: binaries
+        # built there need its glibc (2.39) or newer, and no more.
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
           - target: universal-apple-darwin
