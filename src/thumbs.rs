@@ -393,15 +393,21 @@ fn decode_png(file: &Path) -> Result<(Image, TextChunks), Box<dyn std::error::Er
     let data = &buf[..frame.buffer_size()];
     let pixels: Vec<u32> = match frame.color_type {
         png::ColorType::Rgba => data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| argb(c[3], c[0], c[1], c[2]))
             .collect(),
         png::ColorType::Rgb => data
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| argb(255, c[0], c[1], c[2]))
             .collect(),
         png::ColorType::GrayscaleAlpha => data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| argb(c[1], c[0], c[0], c[0]))
             .collect(),
         png::ColorType::Grayscale => data.iter().map(|&g| argb(255, g, g, g)).collect(),
