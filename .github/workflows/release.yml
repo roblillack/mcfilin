@@ -1,0 +1,73 @@
+name: Release
+
+# cargo-release pushes the tag; this turns it into a GitHub release whose notes
+# are the version's section of CHANGELOG.md, with a binary for each platform
+# attached.
+on:
+  push:
+    tags: ["v[0-9]+.*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A tag whose version has no `## [X.Y.Z]` section in CHANGELOG.md fails
+  # here rather than publishing a release without notes.
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Create GitHub release with changelog notes
+        uses: taiki-e/create-gh-release-action@v1
+        with:
+          changelog: CHANGELOG.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-binaries:
+    name: ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: universal-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev pkg-config
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Archives as mcfilin-<target>.tar.gz (.zip on Windows), each with the
+      # README, the changelog, the license, and the desktop entry and icon.
+      - name: Build and upload binary
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: mcfilin
+          target: ${{ matrix.target }}
+          include: README.md,CHANGELOG.md,LICENSE,contrib/mcfilin.desktop,assets/icons/mcfilin.svg
+          tar: unix
+          zip: windows
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -5,6 +5,26 @@ edition = "2024"
 rust-version = "1.88"
 description = "A file viewer with Miller columns, after NeXTSTEP's File Viewer"
 license = "MIT"
+repository = "https://github.com/roblillack/mcfilin"
+readme = "README.md"
+# The README's screenshot and the CI config stay out of the package.
+exclude = ["docs/", ".github/"]
+
+# cargo-release: `cargo release minor --execute` rolls the changelog's
+# [Unreleased] section over to the new version, re-seeds an empty one above
+# it, and pushes the tag that the Release workflow builds the binaries and
+# the GitHub release from. The substitutions run in order: version, compare
+# link and date first, then the markers put "Unreleased" and "ReleaseDate"
+# back for the next release.
+[package.metadata.release]
+allow-branch = ["main"]
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "Unreleased", replace = "{{version}}" },
+    { file = "CHANGELOG.md", search = '\.\.\.HEAD', replace = "...{{tag_name}}", exactly = 1 },
+    { file = "CHANGELOG.md", search = "ReleaseDate", replace = "{{date}}" },
+    { file = "CHANGELOG.md", search = "<!-- next-header -->", replace = "<!-- next-header -->\n\n## [Unreleased] - ReleaseDate", exactly = 1 },
+    { file = "CHANGELOG.md", search = "<!-- next-url -->", replace = "<!-- next-url -->\n[Unreleased]: https://github.com/roblillack/mcfilin/compare/{{tag_name}}...HEAD", exactly = 1 },
+]
 
 [dependencies]
 saudade = "0.8"
