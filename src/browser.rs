@@ -663,6 +663,11 @@ impl Browser {
         }
     }
 
+    /// Whether the viewer is in the folder of a place on the shelf.
+    pub fn is_current_place(&self, place: usize) -> bool {
+        self.shelf_path(place).as_deref() == Some(self.current_dir())
+    }
+
     /// A click on the shelf, or its item in the Go menu: show that folder.
     pub fn go_to_place(&mut self, place: usize) {
         let Some(path) = self.shelf_path(place) else { return };
@@ -1848,23 +1853,48 @@ impl Browser {
         p.sunken_bevel(area, theme.highlight, theme.shadow);
         let saved = p.push_clip_frame(area, 1, Merged::NONE);
         let highlight = self.highlight();
+        let pressed = match self.gesture {
+            Gesture::ShelfPress { place, .. } => Some(place),
+            _ => None,
+        };
         for place in 0..=self.shelf.len() {
             let cell = self.shelf_cell(place);
             let icon = Self::shelf_icon_rect(cell);
             if highlight == Some(Highlight::ShelfIcon(place)) {
-                p.fill_rect(icon.inset(-3), theme.highlight_bg);
+                fill_rounded_rect(p, icon.inset(-3), 4, theme.highlight_bg);
             }
             let (image, there) = match place {
                 0 => (HOME_LARGE, true),
                 _ => (FOLDER_LARGE, self.shelf_path(place).is_some_and(|p| p.is_dir())),
             };
+            // The place being clicked lights up as a selected row does; the
+            // one the viewer is in, as a selected row in a column without the
+            // keyboard.
+            let lit = if pressed == Some(place) {
+                Some((theme.highlight_bg, theme.highlight_text))
+            } else if self.is_current_place(place) {
+                Some((theme.face, theme.text))
+            } else {
+                None
+            };
+            if let Some((bg, _)) = lit {
+                fill_rounded_rect(p, icon.inset(-3), 4, bg);
+            }
             p.draw_svg(&image, icon);
             let label = fit_text(p, &self.shelf_label(place), theme.font_size, cell.w - 6);
-            let w = p.measure_text(&label, theme.font_size).w;
+            let size = p.measure_text(&label, theme.font_size);
+            let (x, y) = (cell.x + (cell.w - size.w) / 2, icon.bottom() + 5);
             // A folder that's gone — deleted, or on a disk not mounted —
             // stays on the shelf, greyed out.
-            let color = if there { theme.text } else { theme.disabled_text };
-            p.text(cell.x + (cell.w - w) / 2, icon.bottom() + 5, &label, theme.font_size, color);
+            let color = match lit {
+                Some((bg, fg)) => {
+                    p.fill_rect(Rect::new(x - 2, y, size.w + 4, size.h), bg);
+                    fg
+                }
+                None if there => theme.text,
+                None => theme.disabled_text,
+            };
+            p.text(x, y, &label, theme.font_size, color);
         }
         // Where something dropped would go: a bar after the place before it.
         let gap = match (&self.gesture, highlight) {
@@ -2467,6 +2497,24 @@ fn fit_text(p: &Painter, text: &str, size: f32, max_w: i32) -> String {
         }
     }
     chars[..lo].iter().chain(['…'].iter()).collect()
+}
+
+/// Fills `rect` with its corners rounded off by `radius`, crisp in device
+/// pixels.
+fn fill_rounded_rect(p: &mut Painter, rect: Rect, radius: i32, color: Color) {
+    let r = (radius as f32 * p.scale()).round() as i32;
+    p.physical(rect, |p, rect| {
+        let r = r.min(rect.w / 2).min(rect.h / 2);
+        for dy in 0..r {
+            // How far in the curve is on this row, measured at its middle.
+            let off = (r - dy) as f32 - 0.5;
+            let inset = r - ((r * r) as f32 - off * off).max(0.0).sqrt().round() as i32;
+            let w = rect.w - 2 * inset;
+            p.fill_rect(Rect::new(rect.x + inset, rect.y + dy, w, 1), color);
+            p.fill_rect(Rect::new(rect.x + inset, rect.bottom() - 1 - dy, w, 1), color);
+        }
+        p.fill_rect(Rect::new(rect.x, rect.y + r, rect.w, rect.h - 2 * r), color);
+    });
 }
 
 /// A small right-pointing triangle, 4 px wide and 7 tall, its point at

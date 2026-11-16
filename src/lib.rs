@@ -160,7 +160,8 @@ fn on_browser(
 }
 
 /// The menu bar. The Go menu lists the places on the shelf — home, then the
-/// `bookmarks` by their labels — the first ten by Ctrl+1 … Ctrl+0.
+/// `bookmarks` by their labels — the first ten by Ctrl+1 … Ctrl+0, the one
+/// the viewer is in checked.
 fn menu_bar(browser: &Rc<RefCell<Browser>>, bookmarks: &[String]) -> MenuBar {
     let act = |f: fn(&mut Browser)| on_browser(browser, f);
 
@@ -172,7 +173,11 @@ fn menu_bar(browser: &Rc<RefCell<Browser>>, bookmarks: &[String]) -> MenuBar {
     ];
     let escaped = bookmarks.iter().map(|b| b.replace('&', "&&"));
     for (place, label) in std::iter::once("&Home".to_string()).chain(escaped).enumerate() {
-        let mut item = MenuItem::action(label, on_browser(browser, move |b| b.go_to_place(place)));
+        let mut item = MenuItem::action(label, on_browser(browser, move |b| b.go_to_place(place)))
+            .with_checked({
+                let browser = browser.clone();
+                move || browser.borrow().is_current_place(place)
+            });
         if place < 10 {
             let digit = char::from(b'0' + ((place + 1) % 10) as u8);
             item = item.with_accel(Accel::primary(digit));
