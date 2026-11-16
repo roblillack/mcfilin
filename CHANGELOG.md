@@ -10,7 +10,10 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.1.0] - 2026-11-16
+
 Initial release.
 
 <!-- next-url -->
-[Unreleased]: https://github.com/roblillack/mcfilin/compare/fd7657c8f2ccd888d2414bc3d3b5bd7638d7db6a...HEAD
+[Unreleased]: https://github.com/roblillack/mcfilin/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/roblillack/mcfilin/compare/fd7657c8f2ccd888d2414bc3d3b5bd7638d7db6a...v0.1.0
