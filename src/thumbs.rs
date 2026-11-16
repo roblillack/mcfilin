@@ -326,7 +326,9 @@ fn load_valid(file: &Path, uri: &str, mtime: &str) -> Option<Image> {
 /// Writes `img` as a thumbnail with the metadata the standard requires,
 /// atomically and readable only by the user.
 fn save(target: &Path, img: &Image, uri: &str, mtime: &str) -> io::Result<()> {
-    let dir = target.parent().ok_or_else(|| io::Error::other("no parent"))?;
+    let dir = target
+        .parent()
+        .ok_or_else(|| io::Error::other("no parent"))?;
     create_private_dir(dir)?;
     let tmp = dir.join(format!(
         ".{}.mcfilin-{}.tmp",
@@ -366,7 +368,10 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
     }
     #[cfg(not(unix))]
     fs::create_dir_all(dir)
@@ -506,7 +511,10 @@ fn thumbnailers() -> &'static [Thumbnailer] {
                 {
                     continue;
                 }
-                if let Some(t) = fs::read_to_string(&file).ok().and_then(|s| parse_thumbnailer(&s)) {
+                if let Some(t) = fs::read_to_string(&file)
+                    .ok()
+                    .and_then(|s| parse_thumbnailer(&s))
+                {
                     out.push(t);
                 }
             }
@@ -605,10 +613,11 @@ fn thumbnailer_for(mime: &str) -> Option<&'static Thumbnailer> {
         if let Some(t) = all.iter().find(|t| t.mime_types.iter().any(|x| x == m)) {
             return Some(t);
         }
-        if let Some(t) = all
-            .iter()
-            .find(|t| t.mime_types.iter().any(|x| x.contains('*') && mime::glob_match(x, m)))
-        {
+        if let Some(t) = all.iter().find(|t| {
+            t.mime_types
+                .iter()
+                .any(|x| x.contains('*') && mime::glob_match(x, m))
+        }) {
             return Some(t);
         }
     }
@@ -703,7 +712,13 @@ mod tests {
             split_exec(r#"foo -s %s "%u" %o"#),
             ["foo", "-s", "%s", "%u", "%o"]
         );
-        let e = expand("--size=%s", Path::new("/a"), "file:///a", Path::new("/o"), Size::Large);
+        let e = expand(
+            "--size=%s",
+            Path::new("/a"),
+            "file:///a",
+            Path::new("/o"),
+            Size::Large,
+        );
         assert_eq!(e, "--size=256");
     }
 

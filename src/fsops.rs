@@ -428,7 +428,10 @@ mod tests {
         let (done, errors) = transfer(&sources, &b, Op::Link);
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(done, [b.join("file.txt"), b.join("sub")]);
-        assert_eq!(fs::read_link(b.join("file.txt")).unwrap(), a.join("file.txt"));
+        assert_eq!(
+            fs::read_link(b.join("file.txt")).unwrap(),
+            a.join("file.txt")
+        );
         assert_eq!(fs::read_to_string(b.join("file.txt")).unwrap(), "hi");
         assert!(b.join("sub").is_dir());
 

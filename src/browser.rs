@@ -211,7 +211,8 @@ impl BrowserColumn {
         };
         // The bar clamps to its range, which may not be set yet; keep the
         // wanted value in the range we know the list will have.
-        self.bar.set_range(rows as i32, self.entries.len().saturating_sub(rows) as i32);
+        self.bar
+            .set_range(rows as i32, self.entries.len().saturating_sub(rows) as i32);
         self.bar.set_value(new_top as i32);
     }
 }
@@ -313,7 +314,10 @@ enum Gesture {
     },
     /// Pressed on the shelf's icon in `place`, not yet moved far enough to
     /// drag it.
-    ShelfPress { origin: Point, place: usize },
+    ShelfPress {
+        origin: Point,
+        place: usize,
+    },
     /// Dragging the `index`-th bookmark: to the gap before the `gap`-th one,
     /// or, off the shelf, away.
     ShelfDrag {
@@ -328,7 +332,10 @@ enum Click {
     Nothing,
     /// A press on a row of a multi-selection keeps the whole group selected
     /// (so it can be dragged) and narrows it to this row on release.
-    Collapse { slot: usize, row: usize },
+    Collapse {
+        slot: usize,
+        row: usize,
+    },
     /// A press on an icon of the path view goes there on release.
     PathIcon(usize),
 }
@@ -464,7 +471,9 @@ impl Browser {
     /// Opens the columns from the root down to `target`, selecting each step,
     /// and `target` itself in the last column if it is a file.
     pub fn go_to(&mut self, target: &Path) {
-        let target = target.canonicalize().unwrap_or_else(|_| target.to_path_buf());
+        let target = target
+            .canonicalize()
+            .unwrap_or_else(|_| target.to_path_buf());
         let mut steps: Vec<&Path> = target.ancestors().collect();
         steps.reverse();
         let Some((root, rest)) = steps.split_first() else {
@@ -623,7 +632,9 @@ impl Browser {
     fn can_shelve(&self, paths: &[PathBuf]) -> bool {
         !paths.is_empty()
             && paths.iter().all(|p| p.is_dir())
-            && paths.iter().any(|p| *p != self.home && !self.shelf.contains(p))
+            && paths
+                .iter()
+                .any(|p| *p != self.home && !self.shelf.contains(p))
     }
 
     /// Puts the folders among `paths` on the shelf, before the `at`-th
@@ -670,7 +681,9 @@ impl Browser {
 
     /// A click on the shelf, or its item in the Go menu: show that folder.
     pub fn go_to_place(&mut self, place: usize) {
-        let Some(path) = self.shelf_path(place) else { return };
+        let Some(path) = self.shelf_path(place) else {
+            return;
+        };
         if path.is_dir() {
             self.go_to(&path);
         } else {
@@ -692,11 +705,13 @@ impl Browser {
             }
             self.columns[i].reread(self.show_hidden);
             let want = self.columns[i].single_dir();
-            let next_ok = matches!((&want, self.columns.get(i + 1)), (Some(w), Some(next)) if next.dir == *w);
+            let next_ok =
+                matches!((&want, self.columns.get(i + 1)), (Some(w), Some(next)) if next.dir == *w);
             if !next_ok {
                 self.columns.truncate(i + 1);
                 if let Some(dir) = want {
-                    self.columns.push(BrowserColumn::open(dir, self.show_hidden));
+                    self.columns
+                        .push(BrowserColumn::open(dir, self.show_hidden));
                 }
             }
             i += 1;
@@ -719,7 +734,8 @@ impl Browser {
         if !keep {
             self.columns.truncate(slot + 1);
             if let Some(dir) = want {
-                self.columns.push(BrowserColumn::open(dir, self.show_hidden));
+                self.columns
+                    .push(BrowserColumn::open(dir, self.show_hidden));
             }
         }
         self.active = slot;
@@ -793,7 +809,10 @@ impl Browser {
     fn enter_next_column(&mut self) {
         let slot = self.active.min(self.columns.len() - 1);
         if self.columns[slot].single_dir().is_some()
-            && self.columns.get(slot + 1).is_some_and(|c| !c.entries.is_empty())
+            && self
+                .columns
+                .get(slot + 1)
+                .is_some_and(|c| !c.entries.is_empty())
         {
             let row = self.columns[slot + 1].lead.unwrap_or(0);
             self.select_row(slot + 1, row);
@@ -894,7 +913,9 @@ impl Browser {
         let (slot, row) = self.rename_target()?;
         let v = slot.checked_sub(self.first).filter(|&v| v < self.visible)?;
         let top = self.columns[slot].bar.value().max(0) as usize;
-        let shown = row.checked_sub(top).filter(|&r| r < self.rows_per_column())?;
+        let shown = row
+            .checked_sub(top)
+            .filter(|&r| r < self.rows_per_column())?;
         let field = Self::field_rect(self.cell(v, self.columns_rect()));
         let y = field.y + ROW_PAD_Y + shown as i32 * ROW_H;
         // The text lands where the label was: the field pads it by 4.
@@ -1025,7 +1046,11 @@ impl Browser {
             }
             self.show_errors(
                 "Couldn't paste",
-                &[format!("{} can't go into “{}”", describe(&paths), fsops::display_name(&dest))],
+                &[format!(
+                    "{} can't go into “{}”",
+                    describe(&paths),
+                    fsops::display_name(&dest)
+                )],
             );
             return;
         }
@@ -1133,10 +1158,7 @@ impl Browser {
     /// How many slots the path has: the columns, plus one for the selected
     /// files of the last column.
     fn slots(&self) -> usize {
-        let files = self
-            .columns
-            .last()
-            .is_some_and(|c| !c.selected.is_empty());
+        let files = self.columns.last().is_some_and(|c| !c.selected.is_empty());
         self.columns.len() + files as usize
     }
 
@@ -1155,7 +1177,11 @@ impl Browser {
     fn shelf_rect(&self) -> Rect {
         let b = self.bounds;
         let rows = (1 + self.shelf.len()).div_ceil(self.shelf_per_row()) as i32;
-        let h = if self.shelf_view { rows * SHELF_ROW_H + 2 } else { 0 };
+        let h = if self.shelf_view {
+            rows * SHELF_ROW_H + 2
+        } else {
+            0
+        };
         Rect::new(b.x + MARGIN, b.y + MARGIN, (b.w - 2 * MARGIN).max(0), h)
     }
 
@@ -1165,12 +1191,22 @@ impl Browser {
         let per_row = self.shelf_per_row();
         let (row, col) = ((place / per_row) as i32, (place % per_row) as i32);
         let w = self.shelf_cell_w();
-        Rect::new(area.x + 1 + col * w, area.y + 1 + row * SHELF_ROW_H, w, SHELF_ROW_H)
+        Rect::new(
+            area.x + 1 + col * w,
+            area.y + 1 + row * SHELF_ROW_H,
+            w,
+            SHELF_ROW_H,
+        )
     }
 
     /// Where the icon of a place on the shelf is drawn.
     fn shelf_icon_rect(cell: Rect) -> Rect {
-        Rect::new(cell.x + (cell.w - LARGE_ICON) / 2, cell.y + 6, LARGE_ICON, LARGE_ICON)
+        Rect::new(
+            cell.x + (cell.w - LARGE_ICON) / 2,
+            cell.y + 6,
+            LARGE_ICON,
+            LARGE_ICON,
+        )
     }
 
     /// The place on the shelf under `pos`.
@@ -1201,7 +1237,11 @@ impl Browser {
         // Over the right half of a place, or past the end of its row, the
         // gap after it; the gap after place `p` is the one before bookmark `p`.
         let after = col >= per_row || dx % cell_w >= cell_w / 2;
-        Some(if after { place } else { place.saturating_sub(1) })
+        Some(if after {
+            place
+        } else {
+            place.saturating_sub(1)
+        })
     }
 
     /// The path view's area: no height at all while it is turned off.
@@ -1220,7 +1260,11 @@ impl Browser {
     /// border. It goes with the path view: no height while that is off.
     fn hscroll_rect(&self) -> Rect {
         let p = self.path_rect();
-        let h = if self.path_view { SCROLLBAR_THICKNESS } else { 0 };
+        let h = if self.path_view {
+            SCROLLBAR_THICKNESS
+        } else {
+            0
+        };
         Rect::new(p.x, p.bottom() - 1, p.w, h)
     }
 
@@ -1232,12 +1276,22 @@ impl Browser {
             self.path_rect().y
         };
         let bottom = b.bottom() - STATUS_H;
-        Rect::new(b.x + MARGIN, top, (b.w - 2 * MARGIN).max(0), (bottom - top).max(0))
+        Rect::new(
+            b.x + MARGIN,
+            top,
+            (b.w - 2 * MARGIN).max(0),
+            (bottom - top).max(0),
+        )
     }
 
     fn status_rect(&self) -> Rect {
         let b = self.bounds;
-        Rect::new(b.x + MARGIN, b.bottom() - STATUS_H, (b.w - 2 * MARGIN).max(0), STATUS_H)
+        Rect::new(
+            b.x + MARGIN,
+            b.bottom() - STATUS_H,
+            (b.w - 2 * MARGIN).max(0),
+            STATUS_H,
+        )
     }
 
     /// The `v`-th of the visible cells across `area`, which share its width
@@ -1253,7 +1307,12 @@ impl Browser {
     }
 
     fn bar_rect(cell: Rect) -> Rect {
-        Rect::new(cell.right() - SCROLLBAR_THICKNESS, cell.y, SCROLLBAR_THICKNESS, cell.h)
+        Rect::new(
+            cell.right() - SCROLLBAR_THICKNESS,
+            cell.y,
+            SCROLLBAR_THICKNESS,
+            cell.h,
+        )
     }
 
     /// The white list area of a column cell, sharing its right border with
@@ -1302,7 +1361,8 @@ impl Browser {
         if !field.contains(pos) || pos.y < field.y + ROW_PAD_Y {
             return None;
         }
-        let row = col.bar.value().max(0) as usize + ((pos.y - field.y - ROW_PAD_Y) / ROW_H) as usize;
+        let row =
+            col.bar.value().max(0) as usize + ((pos.y - field.y - ROW_PAD_Y) / ROW_H) as usize;
         (row < col.entries.len()).then_some(row)
     }
 
@@ -1329,7 +1389,8 @@ impl Browser {
         for col in &mut self.columns {
             col.bar.set_rect(Rect::new(0, 0, 0, 0));
         }
-        self.blank_bars.resize_with(n, || ScrollBar::vertical(Rect::new(0, 0, 0, 0)));
+        self.blank_bars
+            .resize_with(n, || ScrollBar::vertical(Rect::new(0, 0, 0, 0)));
         for v in 0..n {
             let cell = self.cell(v, area);
             let slot = self.first + v;
@@ -1365,7 +1426,11 @@ impl Browser {
             return Some(SlotInfo {
                 icon: FOLDER_LARGE,
                 label: fsops::display_name(&col.dir),
-                paths: if is_root { vec![] } else { vec![col.dir.clone()] },
+                paths: if is_root {
+                    vec![]
+                } else {
+                    vec![col.dir.clone()]
+                },
             });
         }
         let last = self.columns.last()?;
@@ -1375,7 +1440,11 @@ impl Browser {
         let paths = last.selected_paths();
         Some(match &last.selected[..] {
             [i] => SlotInfo {
-                icon: if last.entries[*i].is_dir { FOLDER_LARGE } else { FILE_LARGE },
+                icon: if last.entries[*i].is_dir {
+                    FOLDER_LARGE
+                } else {
+                    FILE_LARGE
+                },
                 label: last.entries[*i].label.clone(),
                 paths,
             },
@@ -1390,7 +1459,12 @@ impl Browser {
     /// What under `pos` would take a drop, whatever is dragged: a folder, or
     /// a gap on the shelf.
     fn raw_target_at(&self, pos: Point) -> Option<Target> {
-        let folder = |dir: PathBuf, highlight| Some(Target { dest: Dest::Folder(dir), highlight });
+        let folder = |dir: PathBuf, highlight| {
+            Some(Target {
+                dest: Dest::Folder(dir),
+                highlight,
+            })
+        };
         if self.shelf_rect().contains(pos) {
             // The middle of a place is its icon; around it, the gaps.
             if let Some(place) = self.shelf_place_at(pos) {
@@ -1426,7 +1500,11 @@ impl Browser {
     /// window, another application's as a copy.
     fn hover_at(&self, pos: Point, mods: Modifiers) -> Hover {
         let target = match &self.os_drag {
-            Some(OsDrag::Bookmark(_)) => return Hover::Bookmark { gap: self.shelf_gap_at(pos) },
+            Some(OsDrag::Bookmark(_)) => {
+                return Hover::Bookmark {
+                    gap: self.shelf_gap_at(pos),
+                };
+            }
             Some(OsDrag::Files(paths)) => {
                 let op = drop_op(mods);
                 self.target_at(pos, paths, op).map(|target| (target, op))
@@ -1519,7 +1597,9 @@ impl Browser {
         let mut click = Click::Nothing;
         let col = &mut self.columns[slot];
         let toggle = mods.control || mods.logo;
-        if mods.shift && let Some(anchor) = col.anchor {
+        if mods.shift
+            && let Some(anchor) = col.anchor
+        {
             let (a, b) = (anchor.min(row), anchor.max(row));
             col.lead = Some(row);
             self.set_selection(slot, (a..=b).collect());
@@ -1583,7 +1663,12 @@ impl Browser {
                     } else {
                         let op = drop_op(ctx.modifiers());
                         let target = self.target_at(pos, &paths, op);
-                        self.gesture = Gesture::Drag { paths, pos, op, target };
+                        self.gesture = Gesture::Drag {
+                            paths,
+                            pos,
+                            op,
+                            target,
+                        };
                     }
                 }
             }
@@ -1631,7 +1716,13 @@ impl Browser {
             Gesture::Drag { paths, .. } => self.target_at(pos, paths, op),
             _ => return,
         };
-        if let Gesture::Drag { pos: p, op: o, target, .. } = &mut self.gesture {
+        if let Gesture::Drag {
+            pos: p,
+            op: o,
+            target,
+            ..
+        } = &mut self.gesture
+        {
             *p = pos;
             *o = op;
             *target = new_target;
@@ -1643,7 +1734,11 @@ impl Browser {
     fn drag_cursor(&self) -> Option<Cursor> {
         match &self.gesture {
             Gesture::Drag { target: None, .. } => Some(Cursor::NoDrop),
-            Gesture::Drag { target: Some(target), op, .. } => Some(match (&target.dest, op) {
+            Gesture::Drag {
+                target: Some(target),
+                op,
+                ..
+            } => Some(match (&target.dest, op) {
                 // The shelf keeps a reference to the folder, as a link does.
                 (Dest::Shelf(_), _) | (Dest::Folder(_), Op::Link) => Cursor::Alias,
                 (Dest::Folder(_), Op::Copy) => Cursor::Copy,
@@ -1865,7 +1960,10 @@ impl Browser {
             }
             let (image, there) = match place {
                 0 => (HOME_LARGE, true),
-                _ => (FOLDER_LARGE, self.shelf_path(place).is_some_and(|p| p.is_dir())),
+                _ => (
+                    FOLDER_LARGE,
+                    self.shelf_path(place).is_some_and(|p| p.is_dir()),
+                ),
             };
             // The place being clicked lights up as a selected row does; the
             // one the viewer is in, as a selected row in a column without the
@@ -1920,7 +2018,9 @@ impl Browser {
         let highlight = self.highlight();
         for v in 0..self.visible {
             let slot = self.first + v;
-            let Some(info) = self.slot_info(slot) else { break };
+            let Some(info) = self.slot_info(slot) else {
+                break;
+            };
             let cell = self.cell(v, area);
             let icon = Rect::new(
                 cell.x + (cell.w - LARGE_ICON) / 2,
@@ -1936,7 +2036,13 @@ impl Browser {
             let label = fit_text(p, &info.label, theme.font_size, cell.w - 8);
             let w = p.measure_text(&label, theme.font_size).w;
             let ly = icon.bottom() + 5;
-            p.text(cell.x + (cell.w - w) / 2, ly, &label, theme.font_size, theme.text);
+            p.text(
+                cell.x + (cell.w - w) / 2,
+                ly,
+                &label,
+                theme.font_size,
+                theme.text,
+            );
 
             if slot + 1 < slots && v + 1 < self.visible {
                 // The little arrow leading on to the next step of the path.
@@ -1957,7 +2063,10 @@ impl Browser {
 
         let highlight = self.highlight();
         let active = self.focused && slot == self.active;
-        let renaming = self.rename_target().filter(|&(s, _)| s == slot).map(|(_, row)| row);
+        let renaming = self
+            .rename_target()
+            .filter(|&(s, _)| s == slot)
+            .map(|(_, row)| row);
         if let Some(col) = self.columns.get(slot) {
             let saved = p.push_clip_frame(field, 1, Merged::RIGHT);
             let top = col.bar.value().max(0) as usize;
@@ -1991,7 +2100,12 @@ impl Browser {
                 }
                 let label_x = icon_x + SMALL_ICON + 4;
                 let arrow_w = if entry.is_dir { 14 } else { 4 };
-                let label = fit_text(p, &entry.label, theme.font_size, field.right() - label_x - arrow_w);
+                let label = fit_text(
+                    p,
+                    &entry.label,
+                    theme.font_size,
+                    field.right() - label_x - arrow_w,
+                );
                 let label_y = y + (ROW_H - theme.font_size as i32) / 2 - 1;
                 p.text(label_x, label_y, &label, theme.font_size, fg);
                 if entry.is_dir {
@@ -2003,7 +2117,13 @@ impl Browser {
             }
             if let Some(err) = &col.error {
                 let msg = fit_text(p, err, theme.font_size, field.w - 12);
-                p.text(field.x + 6, field.y + 6, &msg, theme.font_size, theme.disabled_text);
+                p.text(
+                    field.x + 6,
+                    field.y + 6,
+                    &msg,
+                    theme.font_size,
+                    theme.disabled_text,
+                );
             }
             p.restore_clip(saved);
             if highlight == Some(Highlight::Column(slot)) {
@@ -2073,7 +2193,11 @@ impl Browser {
                         _ => None,
                     }
                 };
-                let icon = if info.is_dir { FOLDER_LARGE } else { FILE_LARGE };
+                let icon = if info.is_dir {
+                    FOLDER_LARGE
+                } else {
+                    FILE_LARGE
+                };
                 (thumb, icon, info.name.clone(), &info.rows)
             }
             Preview::Many(rows) => (
@@ -2103,14 +2227,18 @@ impl Browser {
             }
             None => {
                 let size = 48;
-                p.draw_svg(&icon, Rect::new(field.x + (field.w - size) / 2, y, size, size));
+                p.draw_svg(
+                    &icon,
+                    Rect::new(field.x + (field.w - size) / 2, y, size, size),
+                );
                 y += size + 8;
             }
         }
 
         // The name, bold and centered, wrapped as needed.
         let bold = |p: &Painter, s: &str| {
-            p.measure_text_styled(s, font, FontFamily::Sans, FontStyle::Bold).w
+            p.measure_text_styled(s, font, FontFamily::Sans, FontStyle::Bold)
+                .w
         };
         let lines: Vec<String> = p
             .wrap_text_styled(&name, font, inner_w, FontFamily::Sans, FontStyle::Bold)
@@ -2175,7 +2303,10 @@ impl Browser {
     }
 
     fn status_text(&self) -> String {
-        if let Gesture::Drag { paths, op, target, .. } = &self.gesture {
+        if let Gesture::Drag {
+            paths, op, target, ..
+        } = &self.gesture
+        {
             return drag_status(paths, *op, target.as_ref());
         }
         if let Gesture::ShelfDrag { index, gap, .. } = &self.gesture {
@@ -2376,9 +2507,7 @@ impl Browser {
                 ctx.request_paint();
             }
             Event::KeyDown { key, modifiers } => self.key_down(key, *modifiers, ctx),
-            Event::Char { ch, modifiers } if !modifiers.has_command() => {
-                self.type_ahead(*ch, ctx)
-            }
+            Event::Char { ch, modifiers } if !modifiers.has_command() => self.type_ahead(*ch, ctx),
             Event::DragEnter { pos } | Event::DragMove { pos } => {
                 if !ctx.is_dragging_out() {
                     self.os_drag = None; // over, and this one is another's
@@ -2460,7 +2589,9 @@ fn drag_status(paths: &[PathBuf], op: Op, target: Option<&Target>) -> String {
         Some(Dest::Folder(dir)) => {
             let dir = fsops::display_name(dir);
             match op {
-                Op::Move => format!("Move {what} to “{dir}” — hold Ctrl to copy, Ctrl+Shift to link"),
+                Op::Move => {
+                    format!("Move {what} to “{dir}” — hold Ctrl to copy, Ctrl+Shift to link")
+                }
                 Op::Copy => format!("Copy {what} to “{dir}”"),
                 Op::Link => format!("Link to {what} from “{dir}”"),
             }
@@ -2511,7 +2642,10 @@ fn fill_rounded_rect(p: &mut Painter, rect: Rect, radius: i32, color: Color) {
             let inset = r - ((r * r) as f32 - off * off).max(0.0).sqrt().round() as i32;
             let w = rect.w - 2 * inset;
             p.fill_rect(Rect::new(rect.x + inset, rect.y + dy, w, 1), color);
-            p.fill_rect(Rect::new(rect.x + inset, rect.bottom() - 1 - dy, w, 1), color);
+            p.fill_rect(
+                Rect::new(rect.x + inset, rect.bottom() - 1 - dy, w, 1),
+                color,
+            );
         }
         p.fill_rect(Rect::new(rect.x, rect.y + r, rect.w, rect.h - 2 * r), color);
     });

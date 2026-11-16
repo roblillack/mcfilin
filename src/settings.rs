@@ -28,7 +28,10 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { shelf: true, path_view: true }
+        Self {
+            shelf: true,
+            path_view: true,
+        }
     }
 }
 
@@ -106,7 +109,8 @@ fn pairs(text: &str) -> impl Iterator<Item = (&str, &str)> {
 
 /// The file's text, or nothing if there is no file.
 fn read(path: Option<PathBuf>) -> String {
-    path.and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default()
+    path.and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default()
 }
 
 /// Writes `text` to `path`, creating the folder if need be. Written to a
@@ -147,14 +151,28 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let s = Settings { shelf: false, path_view: false };
+        let s = Settings {
+            shelf: false,
+            path_view: false,
+        };
         assert_eq!(Settings::parse(&s.to_text()), s);
-        let s = Settings { shelf: false, path_view: true };
+        let s = Settings {
+            shelf: false,
+            path_view: true,
+        };
         assert_eq!(Settings::parse(&s.to_text()), s);
-        assert_eq!(Settings::parse(&Settings::default().to_text()), Settings::default());
-        let w = WindowState { size: Some((900, 600)) };
+        assert_eq!(
+            Settings::parse(&Settings::default().to_text()),
+            Settings::default()
+        );
+        let w = WindowState {
+            size: Some((900, 600)),
+        };
         assert_eq!(WindowState::parse(&w.to_text()), w);
-        assert_eq!(WindowState::parse(&WindowState::default().to_text()), WindowState::default());
+        assert_eq!(
+            WindowState::parse(&WindowState::default().to_text()),
+            WindowState::default()
+        );
     }
 
     #[test]

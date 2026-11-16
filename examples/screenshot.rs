@@ -33,27 +33,44 @@ fn main() {
                 "key" => {
                     let (mods, key) = modifiers(arg);
                     let key = Accel::from(key).key;
-                    let mut evs = vec![Event::KeyDown { key, modifiers: mods }];
+                    let mut evs = vec![Event::KeyDown {
+                        key,
+                        modifiers: mods,
+                    }];
                     if let Key::Char(ch) = key
                         && !mods.control
                         && !mods.alt
                     {
-                        evs.push(Event::Char { ch, modifiers: mods });
+                        evs.push(Event::Char {
+                            ch,
+                            modifiers: mods,
+                        });
                     }
                     evs
                 }
                 "type" => arg
                     .chars()
-                    .map(|ch| Event::Char { ch, modifiers: Modifiers::default() })
+                    .map(|ch| Event::Char {
+                        ch,
+                        modifiers: Modifiers::default(),
+                    })
                     .collect(),
                 _ => {
                     let mut xy = arg.split_whitespace().map(|n| n.parse().unwrap());
                     let pos = Point::new(xy.next().unwrap(), xy.next().unwrap());
                     let button = MouseButton::Left;
                     vec![match verb {
-                        "down" => Event::PointerDown { pos, button, modifiers: mods },
+                        "down" => Event::PointerDown {
+                            pos,
+                            button,
+                            modifiers: mods,
+                        },
                         "move" => Event::PointerMove { pos },
-                        "up" => Event::PointerUp { pos, button, modifiers: mods },
+                        "up" => Event::PointerUp {
+                            pos,
+                            button,
+                            modifiers: mods,
+                        },
                         other => panic!("unknown event {other}"),
                     }]
                 }

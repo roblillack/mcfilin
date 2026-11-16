@@ -277,6 +277,10 @@ mod tests {
         assert_eq!(info.name, "info.rs");
         assert!(info.rows.iter().any(|(k, _)| *k == "Size"));
         #[cfg(unix)]
-        assert!(info.rows.iter().any(|(k, v)| *k == "Permissions" && v.starts_with('-')));
+        assert!(
+            info.rows
+                .iter()
+                .any(|(k, v)| *k == "Permissions" && v.starts_with('-'))
+        );
     }
 }

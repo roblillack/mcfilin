@@ -39,11 +39,14 @@ pub fn window(
     start: PathBuf,
     settings: &Settings,
     state: &WindowState,
-) -> (WindowConfig, impl Widget + use<>, impl Fn() -> (Settings, WindowState) + use<>) {
+) -> (
+    WindowConfig,
+    impl Widget + use<>,
+    impl Fn() -> (Settings, WindowState) + use<>,
+) {
     let dialog = Rc::new(RefCell::new(Dialog::new()));
-    let browser = Rc::new_cyclic(|this| {
-        RefCell::new(Browser::new(&start, dialog.clone(), this.clone()))
-    });
+    let browser =
+        Rc::new_cyclic(|this| RefCell::new(Browser::new(&start, dialog.clone(), this.clone())));
     browser.borrow_mut().set_shelf_view(settings.shelf);
     browser.borrow_mut().set_path_view(settings.path_view);
 
@@ -72,7 +75,11 @@ pub fn window(
                 shelf: browser.shelf_view(),
                 path_view: browser.path_view(),
             };
-            let size = if b.w > 0 && b.h > 0 { Some((b.w, b.h)) } else { saved };
+            let size = if b.w > 0 && b.h > 0 {
+                Some((b.w, b.h))
+            } else {
+                saved
+            };
             (settings, WindowState { size })
         }
     };
@@ -92,7 +99,11 @@ impl Menus {
     fn new(browser: Rc<RefCell<Browser>>) -> Self {
         let bookmarks = browser.borrow_mut().bookmark_labels();
         let bar = menu_bar(&browser, &bookmarks);
-        Self { bar, browser, bookmarks }
+        Self {
+            bar,
+            browser,
+            bookmarks,
+        }
     }
 
     /// Rebuilds the bar if the shelf changed — but not while a menu is open.
@@ -172,7 +183,10 @@ fn menu_bar(browser: &Rc<RefCell<Browser>>, bookmarks: &[String]) -> MenuBar {
         MenuItem::separator(),
     ];
     let escaped = bookmarks.iter().map(|b| b.replace('&', "&&"));
-    for (place, label) in std::iter::once("&Home".to_string()).chain(escaped).enumerate() {
+    for (place, label) in std::iter::once("&Home".to_string())
+        .chain(escaped)
+        .enumerate()
+    {
         let mut item = MenuItem::action(label, on_browser(browser, move |b| b.go_to_place(place)))
             .with_checked({
                 let browser = browser.clone();
@@ -241,8 +255,7 @@ fn menu_bar(browser: &Rc<RefCell<Browser>>, bookmarks: &[String]) -> MenuBar {
                         let browser = browser.clone();
                         move || browser.borrow().show_hidden()
                     }),
-                MenuItem::action("&Reload", act(Browser::reload))
-                    .with_accel(Accel::primary('r')),
+                MenuItem::action("&Reload", act(Browser::reload)).with_accel(Accel::primary('r')),
             ],
         ))
         .add_menu(Menu::new("&Go", go))

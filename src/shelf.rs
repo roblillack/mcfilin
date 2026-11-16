@@ -85,15 +85,24 @@ impl Shelf {
         if modified(file) == self.stamp {
             return false;
         }
-        let user_dirs = file.parent().and_then(Path::parent).map(|c| c.join("user-dirs.dirs"));
-        *self = Self::load_from(self.file.clone(), user_dirs, std::env::home_dir().as_deref());
+        let user_dirs = file
+            .parent()
+            .and_then(Path::parent)
+            .map(|c| c.join("user-dirs.dirs"));
+        *self = Self::load_from(
+            self.file.clone(),
+            user_dirs,
+            std::env::home_dir().as_deref(),
+        );
         true
     }
 
     /// Writes the bookmarks file, through a symbolic link if it is one, so a
     /// file kept with the dotfiles stays where it is.
     pub fn save(&mut self) -> io::Result<()> {
-        let Some(file) = &self.file else { return Ok(()) };
+        let Some(file) = &self.file else {
+            return Ok(());
+        };
         let target = std::fs::canonicalize(file).unwrap_or_else(|_| file.clone());
         write(Some(target), &to_text(&self.lines))?;
         self.stamp = modified(file);
@@ -150,7 +159,10 @@ impl Shelf {
             if !path.is_absolute() || self.contains(path) {
                 continue;
             }
-            let bookmark = Bookmark { path: path.clone(), label: None };
+            let bookmark = Bookmark {
+                path: path.clone(),
+                label: None,
+            };
             self.lines.insert(line, Line::Folder(bookmark));
             line += 1;
             added += 1;
@@ -353,7 +365,10 @@ mod tests {
     }
 
     fn paths(shelf: &Shelf) -> Vec<String> {
-        shelf.bookmarks().map(|b| b.path.display().to_string()).collect()
+        shelf
+            .bookmarks()
+            .map(|b| b.path.display().to_string())
+            .collect()
     }
 
     #[test]
@@ -362,7 +377,10 @@ mod tests {
         let uri = uri_from_path(p);
         assert_eq!(uri, "file:///home/me/My%20Stuff/50%25/%C3%A4");
         assert_eq!(path_from_uri(&uri).as_deref(), Some(p));
-        assert_eq!(path_from_uri("file://localhost/tmp").as_deref(), Some(Path::new("/tmp")));
+        assert_eq!(
+            path_from_uri("file://localhost/tmp").as_deref(),
+            Some(Path::new("/tmp"))
+        );
         assert_eq!(path_from_uri("file://server/tmp"), None);
         assert_eq!(path_from_uri("sftp://host/tmp"), None);
         assert_eq!(path_from_uri("file:///bad%2"), None);
@@ -412,7 +430,10 @@ mod tests {
         let file = dir.join("gtk-3.0/bookmarks");
         let mut shelf = Shelf::load_from(Some(file.clone()), Some(user_dirs.clone()), Some(&home));
         let want = |names: &[&str]| -> Vec<String> {
-            names.iter().map(|n| home.join(n).display().to_string()).collect()
+            names
+                .iter()
+                .map(|n| home.join(n).display().to_string())
+                .collect()
         };
         assert_eq!(paths(&shelf), want(&["Documents", "Music"]));
         assert!(!file.exists());
@@ -448,7 +469,11 @@ mod tests {
         shelf.insert(99, &["/z".into()]);
         assert_eq!(paths(&shelf), ["/c", "/n", "/m", "/b", "/z"]);
         shelf.save().unwrap();
-        assert!(std::fs::read_to_string(&file).unwrap().contains("smb://x/y\n"));
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("smb://x/y\n")
+        );
 
         // Another program changes the file.
         assert!(!shelf.refresh());

@@ -36,7 +36,12 @@ pub fn data_dirs() -> Vec<PathBuf> {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
-    dirs.extend(system.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+    dirs.extend(
+        system
+            .split(':')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
+    );
     dirs
 }
 
@@ -370,7 +375,10 @@ mod tests {
         let meta = fs::metadata(file!()).unwrap();
         assert_eq!(db.guess(Path::new("x.png"), &meta), "image/png");
         assert_eq!(db.guess(Path::new("X.PNG"), &meta), "image/png");
-        assert!(db.ancestors("text/x-csrc").contains(&"text/plain".to_string()));
+        assert!(
+            db.ancestors("text/x-csrc")
+                .contains(&"text/plain".to_string())
+        );
         assert!(db.comment("image/png").is_some());
     }
 }
