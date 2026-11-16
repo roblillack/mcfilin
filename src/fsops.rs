@@ -225,9 +225,7 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
     }
     let dir = path.parent().unwrap_or(Path::new(""));
     let target = dir.join(new_name);
-    if let Ok(existing) = target.symlink_metadata()
-        && !same_file(&path.symlink_metadata()?, &existing)
-    {
+    if target.symlink_metadata().is_ok() && !same_entry(path, &target)? {
         return Err(io::Error::other(format!(
             "“{new_name}” already exists in “{}”",
             display_name(dir)
@@ -237,15 +235,24 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
     Ok(target)
 }
 
+/// Whether `a` and `b` are one and the same entry in a folder, as they are
+/// when renaming to its own name, or to its name in another case on a file
+/// system that ignores case.
 #[cfg(unix)]
-fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+fn same_entry(a: &Path, b: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
-    (a.dev(), a.ino()) == (b.dev(), b.ino())
+    let (a, b) = (a.symlink_metadata()?, b.symlink_metadata()?);
+    Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
 }
 
+/// Stable Rust has no file IDs on Windows, so this asks for names that match
+/// but for case, and resolve to the same file: a link of another name to the
+/// same file isn't one entry, and neither is a name in a case-sensitive
+/// folder that only matches another but for case.
 #[cfg(not(unix))]
-fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
-    false
+fn same_entry(a: &Path, b: &Path) -> io::Result<bool> {
+    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+    Ok(name(a).is_some() && name(a) == name(b) && a.canonicalize()? == b.canonicalize()?)
 }
 
 /// Moves each of `paths` to the trash. Returns a message for each that
@@ -463,6 +470,14 @@ mod tests {
         }
         // Renaming to its own name is no clash.
         assert!(rename(&dir.join("c"), "c").is_ok());
+        // Nor is a change of case, though on Windows and macOS it names the
+        // same file.
+        assert_eq!(rename(&dir.join("c"), "C").unwrap(), dir.join("C"));
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(names.contains(&"C".into()), "{names:?}");
         fs::remove_dir_all(dir).unwrap();
     }
 

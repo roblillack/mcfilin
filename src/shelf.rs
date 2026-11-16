@@ -14,7 +14,6 @@
 //! bookmarks — and the file is written only once the shelf is changed. Changes made by other programs are picked
 //! up when the file's modification time changes.
 
-use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -302,9 +301,6 @@ fn unescape(s: &str) -> String {
 fn path_from_uri(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let rest = rest.strip_prefix("localhost").unwrap_or(rest);
-    if !rest.starts_with('/') {
-        return None; // another host
-    }
     let mut bytes = Vec::with_capacity(rest.len());
     let mut iter = rest.bytes();
     while let Some(b) = iter.next() {
@@ -315,13 +311,13 @@ fn path_from_uri(uri: &str) -> Option<PathBuf> {
             bytes.push(b);
         }
     }
-    Some(PathBuf::from(os_string(bytes)?))
+    path_from_uri_bytes(bytes)
 }
 
 fn uri_from_path(path: &Path) -> String {
     const KEEP: &[u8] = b"-._~/!$&'()*+,;=:@";
     let mut uri = String::from("file://");
-    for &b in os_bytes(path).iter() {
+    for &b in uri_bytes(path).iter() {
         if b.is_ascii_alphanumeric() || KEEP.contains(&b) {
             uri.push(b as char);
         } else {
@@ -331,26 +327,81 @@ fn uri_from_path(path: &Path) -> String {
     uri
 }
 
+/// The path that a URI's decoded part after `file://` names: one starting
+/// with a slash, as any other host's isn't ours.
 #[cfg(unix)]
-fn os_string(bytes: Vec<u8>) -> Option<OsString> {
+fn path_from_uri_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
-    Some(OsString::from_vec(bytes))
+    if bytes.first() != Some(&b'/') {
+        return None; // another host
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
 
 #[cfg(not(unix))]
-fn os_string(bytes: Vec<u8>) -> Option<OsString> {
-    String::from_utf8(bytes).ok().map(OsString::from)
+fn path_from_uri_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    windows_path_from_uri(&String::from_utf8(bytes).ok()?).map(PathBuf::from)
 }
 
+/// What goes after `file://` for `path`, not yet escaped.
 #[cfg(unix)]
-fn os_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+fn uri_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
     use std::os::unix::ffi::OsStrExt;
     path.as_os_str().as_bytes().into()
 }
 
 #[cfg(not(unix))]
-fn os_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
-    path.to_string_lossy().into_owned().into_bytes().into()
+fn uri_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    windows_uri_path(&path.to_string_lossy())
+        .into_bytes()
+        .into()
+}
+
+/// What goes after `file://` for a Windows path, as GTK writes it: forward
+/// slashes, `/C:/Users/me` for a drive, and `server/share/folder` for a
+/// network share, the server being the URI's host. The `\\?\` prefix of a
+/// verbatim path is dropped.
+#[cfg(any(not(unix), test))]
+fn windows_uri_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let path = match path.strip_prefix("//?/") {
+        Some(rest) => match rest.strip_prefix("UNC/") {
+            Some(share) => format!("//{share}"),
+            None => rest.to_string(),
+        },
+        None => path,
+    };
+    match path.strip_prefix("//") {
+        Some(share) => share.to_string(),
+        None if path.starts_with('/') => path,
+        None => format!("/{path}"),
+    }
+}
+
+/// The Windows path the decoded part of a URI after `file://` names: a
+/// drive's (`/C:/Users/me`) or a network share's (`server/share/folder`).
+/// Anything else isn't a full Windows path.
+#[cfg(any(not(unix), test))]
+fn windows_path_from_uri(rest: &str) -> Option<String> {
+    match rest.strip_prefix('/') {
+        Some(path) => {
+            let b = path.as_bytes();
+            let drive = b.len() >= 2
+                && b[0].is_ascii_alphabetic()
+                && b[1] == b':'
+                && (b.len() == 2 || b[2] == b'/');
+            if !drive {
+                return None;
+            }
+            let mut path = path.replace('/', "\\");
+            if path.len() == 2 {
+                path.push('\\');
+            }
+            Some(path)
+        }
+        None if rest.contains('/') => Some(format!("\\\\{}", rest.replace('/', "\\"))),
+        None => None,
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +415,23 @@ mod tests {
         dir
     }
 
+    /// Where these tests' absolute paths start: `/` here, a drive on
+    /// Windows; as in a path, and as in a URI.
+    #[cfg(unix)]
+    const ROOT: (&str, &str) = ("/", "/");
+    #[cfg(not(unix))]
+    const ROOT: (&str, &str) = ("C:\\", "/C:/");
+
+    /// The absolute path `rel` names below [`ROOT`].
+    fn abs(rel: &str) -> String {
+        ROOT.0.to_string() + &rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
+
+    /// The URI of [`abs`]`(rel)`, `rel` being escaped already.
+    fn uri(rel: &str) -> String {
+        format!("file://{}{rel}", ROOT.1)
+    }
+
     fn paths(shelf: &Shelf) -> Vec<String> {
         shelf
             .bookmarks()
@@ -372,6 +440,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn uris() {
         let p = Path::new("/home/me/My Stuff/50%/ä");
         let uri = uri_from_path(p);
@@ -387,21 +456,58 @@ mod tests {
     }
 
     #[test]
+    fn windows_uris() {
+        let both = |path: &str, uri: &str| {
+            assert_eq!(windows_uri_path(path), uri, "{path}");
+            assert_eq!(windows_path_from_uri(uri).as_deref(), Some(path), "{uri}");
+        };
+        both(r"C:\Users\me\My Stuff", "/C:/Users/me/My Stuff");
+        both(r"D:\", "/D:/");
+        both(r"\\server\share\folder", "server/share/folder");
+        assert_eq!(windows_uri_path(r"\\?\C:\Users"), "/C:/Users");
+        assert_eq!(windows_uri_path(r"\\?\UNC\server\share"), "server/share");
+        assert_eq!(windows_path_from_uri("/C:"), Some(r"C:\".into()));
+        for not_full in ["/home/me", "/", "/C", "/CD:/x", "server", ""] {
+            assert_eq!(windows_path_from_uri(not_full), None, "{not_full}");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_uris_round_trip() {
+        let p = Path::new(r"C:\Users\me\50%\ä");
+        let uri = uri_from_path(p);
+        assert_eq!(uri, "file:///C:/Users/me/50%25/%C3%A4");
+        assert_eq!(path_from_uri(&uri).as_deref(), Some(p));
+        assert_eq!(
+            path_from_uri("file://localhost/C:/tmp").as_deref(),
+            Some(Path::new(r"C:\tmp"))
+        );
+        assert_eq!(path_from_uri("file:///home/me"), None);
+    }
+
+    #[test]
     fn keeps_labels_and_other_lines() {
-        let text = "file:///home/me/Documents\nsftp://host/srv Server\n\nfile:///home/me/a%20b Work things\n";
-        let lines = parse(text);
+        let text = format!(
+            "{}\nsftp://host/srv Server\n\n{} Work things\n",
+            uri("home/me/Documents"),
+            uri("home/me/a%20b")
+        );
+        let lines = parse(&text);
         assert_eq!(lines.len(), 3);
         assert_eq!(
             lines[2],
             Line::Folder(Bookmark {
-                path: PathBuf::from("/home/me/a b"),
+                path: abs("home/me/a b").into(),
                 label: Some("Work things".into())
             })
         );
         assert_eq!(to_text(&lines), text.replace("\n\n", "\n"));
     }
 
+    // `user-dirs.dirs` is for Unix desktops; its paths are Unix ones.
     #[test]
+    #[cfg(unix)]
     fn reads_user_dirs() {
         let text = "# comment\nXDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\nXDG_DESKTOP_DIR=\"$HOME/Desktop\"\nXDG_MUSIC_DIR=\"/srv/My\\ Music\"\nXDG_VIDEOS_DIR=\"$HOME\"\nXDG_X_DIR=\"relative\"\nOTHER=\"/x\"\n";
         let home = Path::new("/home/me");
@@ -449,25 +555,28 @@ mod tests {
     fn inserts_moves_and_removes_around_other_lines() {
         let dir = scratch("edit");
         let file = dir.join("bookmarks");
-        std::fs::write(&file, "file:///a\nsmb://x/y\nfile:///b\nfile:///c\n").unwrap();
+        let text = format!("{}\nsmb://x/y\n{}\n{}\n", uri("a"), uri("b"), uri("c"));
+        std::fs::write(&file, text).unwrap();
         let mut shelf = Shelf::load_from(Some(file.clone()), None, None);
-        assert_eq!(paths(&shelf), ["/a", "/b", "/c"]);
+        let want = |names: &[&str]| -> Vec<String> { names.iter().map(|n| abs(n)).collect() };
+        assert_eq!(paths(&shelf), want(&["a", "b", "c"]));
 
         // Already there, or not absolute: skipped.
-        let added = shelf.insert(1, &["/n".into(), "/b".into(), "rel".into(), "/m".into()]);
+        let new = [abs("n"), abs("b"), "rel".into(), abs("m")].map(PathBuf::from);
+        let added = shelf.insert(1, &new);
         assert_eq!(added, 2);
-        assert_eq!(paths(&shelf), ["/a", "/n", "/m", "/b", "/c"]);
+        assert_eq!(paths(&shelf), want(&["a", "n", "m", "b", "c"]));
 
         assert!(shelf.move_to(0, 5));
-        assert_eq!(paths(&shelf), ["/n", "/m", "/b", "/c", "/a"]);
+        assert_eq!(paths(&shelf), want(&["n", "m", "b", "c", "a"]));
         assert!(shelf.move_to(3, 0));
-        assert_eq!(paths(&shelf), ["/c", "/n", "/m", "/b", "/a"]);
+        assert_eq!(paths(&shelf), want(&["c", "n", "m", "b", "a"]));
         assert!(!shelf.move_to(2, 2) && !shelf.move_to(2, 3) && !shelf.move_to(9, 0));
 
         assert!(shelf.remove(4));
         assert!(!shelf.remove(4));
-        shelf.insert(99, &["/z".into()]);
-        assert_eq!(paths(&shelf), ["/c", "/n", "/m", "/b", "/z"]);
+        shelf.insert(99, &[abs("z").into()]);
+        assert_eq!(paths(&shelf), want(&["c", "n", "m", "b", "z"]));
         shelf.save().unwrap();
         assert!(
             std::fs::read_to_string(&file)
@@ -478,9 +587,9 @@ mod tests {
         // Another program changes the file.
         assert!(!shelf.refresh());
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&file, "file:///q\n").unwrap();
+        std::fs::write(&file, uri("q") + "\n").unwrap();
         assert!(shelf.refresh());
-        assert_eq!(paths(&shelf), ["/q"]);
+        assert_eq!(paths(&shelf), want(&["q"]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
