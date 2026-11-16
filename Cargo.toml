@@ -35,6 +35,8 @@ saudade = "0.9"
 # Thumbnails: the cache names them by the MD5 of the file's URI, and they are PNGs.
 md-5 = "0.10"
 png = "0.17"
+# Canonical paths without Windows' `\\?\` prefix where it isn't needed.
+dunce = "1"
 
 # Cut, Copy and Paste of files through the system clipboard, configured as
 # saudade has it.

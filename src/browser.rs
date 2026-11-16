@@ -471,9 +471,9 @@ impl Browser {
     /// Opens the columns from the root down to `target`, selecting each step,
     /// and `target` itself in the last column if it is a file.
     pub fn go_to(&mut self, target: &Path) {
-        let target = target
-            .canonicalize()
-            .unwrap_or_else(|_| target.to_path_buf());
+        // Not as `\\?\C:\…` on Windows, which neither people nor the shelf's
+        // paths go by.
+        let target = dunce::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
         let mut steps: Vec<&Path> = target.ancestors().collect();
         steps.reverse();
         let Some((root, rest)) = steps.split_first() else {
